@@ -1,0 +1,83 @@
+_wandb:
+    value:
+        cli_version: 0.23.1
+        e:
+            7dosblvzke8od5rrs71dvivkqb5tyczs:
+                codePath: hyperparameter_tuning.py
+                codePathLocal: hyperparameter_tuning.py
+                cpu_count: 6
+                cpu_count_logical: 12
+                cudaVersion: "12.7"
+                disk:
+                    /:
+                        total: "982820896768"
+                        used: "473497505792"
+                email: ege.doganay@ug.bilkent.edu.tr
+                executable: /home/doganay/miniconda3/envs/nlp/bin/python
+                git:
+                    commit: 195d33a5b33f553965de47a0ecb131164a8b033c
+                    remote: https://github.com/ege-dgny/paraJepa.git
+                gpu: NVIDIA GeForce GTX 1070 Ti
+                gpu_count: 1
+                gpu_nvidia:
+                    - architecture: Pascal
+                      cudaCores: 2432
+                      memoryTotal: "8589934592"
+                      name: NVIDIA GeForce GTX 1070 Ti
+                      uuid: GPU-b12bf437-3efd-9567-12ca-dc4ab09396ba
+                host: doganay-System-Product-Name
+                memory:
+                    total: "33584775168"
+                os: Linux-6.8.0-87-generic-x86_64-with-glibc2.35
+                program: /home/doganay/Desktop/paraJepa/hyperparameter_tuning.py
+                python: CPython 3.11.14
+                root: /home/doganay/Desktop/paraJepa
+                startedAt: "2025-12-06T10:27:41.347994Z"
+                writerId: 7dosblvzke8od5rrs71dvivkqb5tyczs
+        m: []
+        python_version: 3.11.14
+        t:
+            "1":
+                - 1
+                - 11
+                - 49
+                - 51
+            "2":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 51
+            "3":
+                - 1
+                - 13
+                - 16
+            "4": 3.11.14
+            "5": 0.23.1
+            "6": 4.57.3
+            "12": 0.23.1
+            "13": linux-x86_64
+batch_size:
+    value: 16
+ema_decay:
+    value: 0.996
+epochs:
+    value: 20
+hidden_dim:
+    value: 768
+learning_rate:
+    value: 2e-05
+max_length:
+    value: 128
+model_name:
+    value: roberta-base
+pred_depth:
+    value: 3
+seed:
+    value: 11
+total_params:
+    value: 251215872
+trainable_params:
+    value: 125978112
+weight_decay:
+    value: 0.01

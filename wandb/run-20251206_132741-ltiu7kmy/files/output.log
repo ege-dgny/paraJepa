@@ -1,0 +1,26 @@
+Using CUDA
+tokenizer_config.json: 100%|████████████████████████████████████████████████████████████| 25.0/25.0 [00:00<00:00, 139kB/s]
+config.json: 100%|████████████████████████████████████████████████████████████████████████| 481/481 [00:00<00:00, 731kB/s]
+vocab.json: 100%|██████████████████████████████████████████████████████████████████████| 899k/899k [00:00<00:00, 2.21MB/s]
+merges.txt: 100%|██████████████████████████████████████████████████████████████████████| 456k/456k [00:00<00:00, 3.38MB/s]
+tokenizer.json: 100%|████████████████████████████████████████████████████████████████| 1.36M/1.36M [00:00<00:00, 6.56MB/s]
+README.md: 1.80kB [00:00, 1.07MB/s]
+chatgpt_paraphrases.csv: 100%|█████████████████████████████████████████████████████████| 265M/265M [00:19<00:00, 13.7MB/s]
+Generating train split: 100%|██████████████████████████████████████████| 419197/419197 [00:02<00:00, 159335.30 examples/s]
+model.safetensors: 100%|███████████████████████████████████████████████████████████████| 499M/499M [00:56<00:00, 8.90MB/s]
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+starting epoch 1/20
+Training:   2%|█▏                                                     | 450/20960 [03:24<2:35:10,  2.20it/s, loss=0.00378]
+Traceback (most recent call last):
+  File "/home/doganay/Desktop/paraJepa/hyperparameter_tuning.py", line 228, in <module>
+    main()
+  File "/home/doganay/Desktop/paraJepa/hyperparameter_tuning.py", line 220, in main
+    train(config=config, use_wandb=True)
+  File "/home/doganay/Desktop/paraJepa/hyperparameter_tuning.py", line 187, in train
+    metrics = train_para_jepa(
+              ^^^^^^^^^^^^^^^^
+  File "/home/doganay/Desktop/paraJepa/para_jepa_train.py", line 106, in train_para_jepa
+    total_loss += loss.item()
+                  ^^^^^^^^^^^
+KeyboardInterrupt

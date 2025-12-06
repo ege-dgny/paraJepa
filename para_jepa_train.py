@@ -6,6 +6,7 @@ from JEPA_Models import JEPAEncoder, JEPAPredictor
 import copy
 from tqdm import tqdm
 import json
+import wandb
 
 class ParaJEPA(nn.Module):
     def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3):
@@ -68,7 +69,7 @@ def evaluation(model, dataloader, device, desc='Validation'):
     cosine_sim = F.cosine_similarity(prediction, target_embeddings, dim=-1).mean().item()
     return avg_loss, cosine_sim
 
-def train_para_jepa(model, train_loader, valid_loader, optimizer, device, epochs=10, ):
+def train_para_jepa(model, train_loader, valid_loader, optimizer, device, epochs=10, use_wandb=False):
     best_val_loss = float('inf')
     training_history = {
         'train_loss': [],
@@ -120,9 +121,27 @@ def train_para_jepa(model, train_loader, valid_loader, optimizer, device, epochs
         training_history['val_cosine_sim'].append(val_cosine_sim)
         training_history['epochs'].append(epoch + 1)
         
+        # Log to W&B if enabled
+        if use_wandb:
+            wandb.log({
+                'epoch': epoch + 1,
+                'train_loss': avg_loss,
+                'val_loss': val_loss,
+                'val_cosine_sim': val_cosine_sim,
+                'best_val_loss': best_val_loss
+            })
+        
         # Save history
         with open('training_history.json', 'w') as f:
             json.dump(training_history, f, indent=2)
+
+    # Return metrics for W&B
+    return {
+        'best_val_loss': best_val_loss,
+        'final_train_loss': avg_loss,
+        'final_val_loss': val_loss,
+        'final_val_cosine_sim': val_cosine_sim
+    }
             
 def test_run(model, test_loader, device):
     print('Running Final Test')
@@ -135,3 +154,8 @@ def test_run(model, test_loader, device):
     
     test_loss, test_cosine_sim = evaluation(model, test_loader, device, desc="Test")
     print(f"Test loss: {test_loss:.4f}, Test cosine similarity: {test_cosine_sim:.4f}")
+    
+    return {
+        'test_loss': test_loss,
+        'test_cosine_sim': test_cosine_sim
+    }
