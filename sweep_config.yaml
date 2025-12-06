@@ -30,7 +30,7 @@ parameters:
 
   batch_size:
     distribution: categorical
-    values: 16
+    values: [16]
 
   
   learning_rate:

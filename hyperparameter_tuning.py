@@ -42,7 +42,6 @@ def get_device():
     else:
         device = torch.device('cpu')
         print("Using CPU")
-        raise Exception("No GPU found")
     return device
 
 
@@ -226,4 +225,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
