@@ -11,16 +11,15 @@ import numpy as np
 from config import Config
 
 def get_device():
-    if torch.backends.cuda.is_built():
+    if torch.backends.cuda.is_built() and torch.cuda.is_available():
         print("Using CUDA")
-        device =torch.device('cuda')
-    elif torch.backends.mps.is_built():
+        device = torch.device('cuda')
+    elif torch.backends.mps.is_built() and torch.backends.mps.is_available():
         print("Using MPS")
         device = torch.device('mps')
     else:
         device = torch.device('cpu')
-        print("Using CPU")
-        raise Exception("No GPU found")
+        print("Using CPU (no GPU available)")
     return device
 
 def set_seed(seed=11):
