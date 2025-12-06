@@ -5,9 +5,10 @@ from transformers import AutoModel, AutoConfig, AutoTokenizer
 from JEPA_Models import JEPAEncoder, JEPAPredictor
 import copy
 from tqdm import tqdm
+import json
 
 class ParaJEPA(nn.Module):
-    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996,):
+    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3):
         super().__init__()
         self.ema_decay = ema_decay
 
@@ -22,7 +23,7 @@ class ParaJEPA(nn.Module):
             input_dim=hidden_dim,
             hidden_dim=int(hidden_dim/2),
             output_dim=hidden_dim,
-            depth=3,
+            depth=pred_depth,
         )
     
     def forward(self, style_input, content_input):
@@ -69,7 +70,12 @@ def evaluation(model, dataloader, device, desc='Validation'):
 
 def train_para_jepa(model, train_loader, valid_loader, optimizer, device, epochs=10, ):
     best_val_loss = float('inf')
-
+    training_history = {
+        'train_loss': [],
+        'val_loss': [],
+        'val_cosine_sim': [],
+        'epochs': [],
+    }
     for epoch in range(epochs):
         print(f"starting epoch {epoch+1}/{epochs}")
         model.train()
@@ -100,7 +106,7 @@ def train_para_jepa(model, train_loader, valid_loader, optimizer, device, epochs
             progress_bar.set_postfix({'loss': loss.item()})
 
         avg_loss = total_loss / len(train_loader)
-        print(f"epoch {epoch+1}/{epochs} completed, trainig loss: {avg_loss:.4f}")
+        print(f"epoch {epoch+1}/{epochs} completed, training loss: {avg_loss:.4f}")
 
         val_loss, val_cosine_sim = evaluation(model, valid_loader, device, desc="Validation")
         print(f"epoch {epoch+1}/{epochs} completed, validation loss: {val_loss:.4f}, validation cosine similarity: {val_cosine_sim:.4f}")
@@ -108,6 +114,15 @@ def train_para_jepa(model, train_loader, valid_loader, optimizer, device, epochs
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), f"para_jepa_best_model.pt")
+
+        training_history['train_loss'].append(avg_loss)
+        training_history['val_loss'].append(val_loss)
+        training_history['val_cosine_sim'].append(val_cosine_sim)
+        training_history['epochs'].append(epoch + 1)
+        
+        # Save history
+        with open('training_history.json', 'w') as f:
+            json.dump(training_history, f, indent=2)
             
 def test_run(model, test_loader, device):
     print('Running Final Test')
