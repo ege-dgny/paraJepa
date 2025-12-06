@@ -1,0 +1,55 @@
+# W&B Sweep Configuration for ParaJEPA Hyperparameter Tuning
+# 
+# Usage:
+#   1. Initialize sweep: wandb sweep sweep_config.yaml
+#   2. Run agent: wandb agent <sweep_id>
+#
+
+program: hyperparameter_tuning.py
+method: bayes  # Options: grid, random, bayes
+metric:
+  name: best_val_loss
+  goal: minimize
+
+parameters:
+  model_name:
+    value: "roberta-base"
+  
+  hidden_dim:
+    value: 768 
+  
+  ema_decay:
+    distribution: uniform
+    min: 0.99
+    max: 0.999
+  
+  pred_depth:
+    distribution: int_uniform
+    min: 2
+    max: 5
+
+  batch_size:
+    distribution: categorical
+    values: 16
+
+  
+  learning_rate:
+    distribution: log_uniform_values
+    min: 1e-6
+    max: 1e-4
+  
+  weight_decay:
+    distribution: uniform
+    min: 0.0
+    max: 0.1
+  
+  epochs:
+    value: 10 
+
+  max_length:
+    distribution: categorical
+    values: [64, 128, 256]
+
+  seed:
+    value: 11 
+
