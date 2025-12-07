@@ -77,6 +77,7 @@ def train_para_jepa(model, train_loader, valid_loader, optimizer, device, epochs
         'val_cosine_sim': [],
         'epochs': [],
     }
+    
     for epoch in range(epochs):
         print(f"starting epoch {epoch+1}/{epochs}")
         model.train()
@@ -84,7 +85,6 @@ def train_para_jepa(model, train_loader, valid_loader, optimizer, device, epochs
         progress_bar = tqdm(train_loader, desc="Training")
 
         for batch in progress_bar:
-
             style_input = {
                 'input_ids': batch['style_input_ids'].to(device),
                 'attention_mask': batch['style_attention_mask'].to(device),
@@ -147,7 +147,7 @@ def test_run(model, test_loader, device):
     print('Running Final Test')
 
     try:
-        model.load_state_dict(torch.load(f"para_jepa_best_model.pt"))
+        model.load_state_dict(torch.load(f"para_jepa_best_model.pt", map_location=device))
     except FileNotFoundError:
         print('No Checkpoint Found')
         return None

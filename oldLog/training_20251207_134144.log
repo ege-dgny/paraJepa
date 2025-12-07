@@ -1,0 +1,99 @@
+W1207 13:41:45.239000 439813 site-packages/torch/distributed/run.py:803] 
+W1207 13:41:45.239000 439813 site-packages/torch/distributed/run.py:803] *****************************************
+W1207 13:41:45.239000 439813 site-packages/torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1207 13:41:45.239000 439813 site-packages/torch/distributed/run.py:803] *****************************************
+Using DDP with 2 GPUs
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+starting epoch 1/10
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/main.py", line 182, in <module>
+[rank0]:     main()
+[rank0]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/main.py", line 165, in main
+[rank0]:     train_para_jepa(
+[rank0]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/para_jepa_train.py", line 120, in train_para_jepa
+[rank0]:     loss, prediction, target_embeddings = model(style_input, content_input)
+[rank0]:                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1657, in forward
+[rank0]:     inputs, kwargs = self._pre_forward(*inputs, **kwargs)
+[rank0]:                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1546, in _pre_forward
+[rank0]:     if torch.is_grad_enabled() and self.reducer._rebuild_buckets():
+[rank0]:                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]: RuntimeError: Expected to have finished reduction in the prior iteration before starting a new one. This error indicates that your module has parameters that were not used in producing loss. You can enable unused parameter detection by passing the keyword argument `find_unused_parameters=True` to `torch.nn.parallel.DistributedDataParallel`, and by 
+[rank0]: making sure all `forward` function outputs participate in calculating loss. 
+[rank0]: If you already have done the above, then the distributed data parallel module wasn't able to locate the output tensors in the return value of your module's `forward` function. Please include the loss function and the structure of the return value of `forward` of your module when reporting this issue (e.g. list, dict, iterable).
+[rank0]: Parameter indices which did not receive grad for rank 0: 197 198
+[rank0]:  In addition, you can set the environment variable TORCH_DISTRIBUTED_DEBUG to either INFO or DETAIL to print out information about which particular parameters did not receive gradient on this rank as part of this error
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/main.py", line 182, in <module>
+[rank1]:     main()
+[rank1]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/main.py", line 165, in main
+[rank1]:     train_para_jepa(
+[rank1]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/para_jepa_train.py", line 120, in train_para_jepa
+[rank1]:     loss, prediction, target_embeddings = model(style_input, content_input)
+[rank1]:                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1657, in forward
+[rank1]:     inputs, kwargs = self._pre_forward(*inputs, **kwargs)
+[rank1]:                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1546, in _pre_forward
+[rank1]:     if torch.is_grad_enabled() and self.reducer._rebuild_buckets():
+[rank1]:                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]: RuntimeError: Expected to have finished reduction in the prior iteration before starting a new one. This error indicates that your module has parameters that were not used in producing loss. You can enable unused parameter detection by passing the keyword argument `find_unused_parameters=True` to `torch.nn.parallel.DistributedDataParallel`, and by 
+[rank1]: making sure all `forward` function outputs participate in calculating loss. 
+[rank1]: If you already have done the above, then the distributed data parallel module wasn't able to locate the output tensors in the return value of your module's `forward` function. Please include the loss function and the structure of the return value of `forward` of your module when reporting this issue (e.g. list, dict, iterable).
+[rank1]: Parameter indices which did not receive grad for rank 1: 197 198
+[rank1]:  In addition, you can set the environment variable TORCH_DISTRIBUTED_DEBUG to either INFO or DETAIL to print out information about which particular parameters did not receive gradient on this rank as part of this error
+E1207 13:41:56.755000 439813 site-packages/torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: 1) local_rank: 0 (pid: 439911) of binary: /home/omnigibson/miniconda3/envs/cv/bin/python3.11
+Traceback (most recent call last):
+  File "/home/omnigibson/miniconda3/envs/cv/bin/torchrun", line 7, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/distributed/run.py", line 936, in main
+    run(args)
+  File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/distributed/run.py", line 927, in run
+    elastic_launch(
+  File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 156, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 293, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+main.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2025-12-07_13:41:56
+  host      : hubu02
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 439912)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2025-12-07_13:41:56
+  host      : hubu02
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 439911)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
