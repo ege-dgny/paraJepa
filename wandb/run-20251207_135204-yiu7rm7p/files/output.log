@@ -1,0 +1,5 @@
+Using CUDA
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+starting epoch 1/10
+Training:   2%|▏         | 418/20960 [00:58<43:13,  7.92it/s, loss=0.00635]  

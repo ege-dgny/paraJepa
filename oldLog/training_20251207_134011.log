@@ -1,0 +1,105 @@
+W1207 13:40:12.587000 438654 site-packages/torch/distributed/run.py:803] 
+W1207 13:40:12.587000 438654 site-packages/torch/distributed/run.py:803] *****************************************
+W1207 13:40:12.587000 438654 site-packages/torch/distributed/run.py:803] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W1207 13:40:12.587000 438654 site-packages/torch/distributed/run.py:803] *****************************************
+Using DDP with 2 GPUs
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+starting epoch 1/10
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/main.py", line 178, in <module>
+[rank1]:     main()
+[rank1]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/main.py", line 161, in main
+[rank1]:     train_para_jepa(
+[rank1]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/para_jepa_train.py", line 109, in train_para_jepa
+[rank1]:     for batch in progress_bar:
+[rank1]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/tqdm/std.py", line 1169, in __iter__
+[rank1]:     for obj in iterable:
+[rank1]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 732, in __next__
+[rank1]:     data = self._next_data()
+[rank1]:            ^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 1506, in _next_data
+[rank1]:     return self._process_data(data, worker_id)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 1541, in _process_data
+[rank1]:     data.reraise()
+[rank1]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/_utils.py", line 769, in reraise
+[rank1]:     raise exception
+[rank1]: TypeError: Caught TypeError in DataLoader worker process 0.
+[rank1]: Original Traceback (most recent call last):
+[rank1]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/utils/data/_utils/worker.py", line 287, in _worker_loop
+[rank1]:     init_fn(worker_id)
+[rank1]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/main.py", line 131, in <lambda>
+[rank1]:     worker_init_fn=lambda worker_id, r=current_rank: np.random.seed(seed + worker_id + r * 1000)
+[rank1]:                                                                     ~~~~~^~~~~~~~~~~
+[rank1]: TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'
+
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/main.py", line 178, in <module>
+[rank0]:     main()
+[rank0]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/main.py", line 161, in main
+[rank0]:     train_para_jepa(
+[rank0]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/para_jepa_train.py", line 109, in train_para_jepa
+[rank0]:     for batch in progress_bar:
+[rank0]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/tqdm/std.py", line 1169, in __iter__
+[rank0]:     for obj in iterable:
+[rank0]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 732, in __next__
+[rank0]:     data = self._next_data()
+[rank0]:            ^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 1506, in _next_data
+[rank0]:     return self._process_data(data, worker_id)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/utils/data/dataloader.py", line 1541, in _process_data
+[rank0]:     data.reraise()
+[rank0]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/_utils.py", line 769, in reraise
+[rank0]:     raise exception
+[rank0]: TypeError: Caught TypeError in DataLoader worker process 0.
+[rank0]: Original Traceback (most recent call last):
+[rank0]:   File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/utils/data/_utils/worker.py", line 287, in _worker_loop
+[rank0]:     init_fn(worker_id)
+[rank0]:   File "/home/omnigibson/Desktop/cv/nlp/paraJepa/main.py", line 131, in <lambda>
+[rank0]:     worker_init_fn=lambda worker_id, r=current_rank: np.random.seed(seed + worker_id + r * 1000)
+[rank0]:                                                                     ~~~~~^~~~~~~~~~~
+[rank0]: TypeError: unsupported operand type(s) for +: 'NoneType' and 'int'
+
+E1207 13:40:23.413000 438654 site-packages/torch/distributed/elastic/multiprocessing/api.py:882] failed (exitcode: 1) local_rank: 0 (pid: 438754) of binary: /home/omnigibson/miniconda3/envs/cv/bin/python3.11
+Traceback (most recent call last):
+  File "/home/omnigibson/miniconda3/envs/cv/bin/torchrun", line 7, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 357, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/distributed/run.py", line 936, in main
+    run(args)
+  File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/distributed/run.py", line 927, in run
+    elastic_launch(
+  File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 156, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/omnigibson/miniconda3/envs/cv/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 293, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+main.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2025-12-07_13:40:23
+  host      : hubu02
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 438755)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2025-12-07_13:40:23
+  host      : hubu02
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 438754)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

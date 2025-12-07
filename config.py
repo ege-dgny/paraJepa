@@ -13,6 +13,7 @@ class Config:
     
     # Data hyperparameters
     max_length = 128
+    num_workers = 12
     
     # System
     seed = 11
