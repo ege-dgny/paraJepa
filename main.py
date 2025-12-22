@@ -1,4 +1,4 @@
-from dataload import ParaphraseDataset
+from dataload import ParaphraseDataset, WikiAutoAssetDataset
 from para_jepa_train import ParaJEPA, train_para_jepa, test_run
 from JEPA_Models import JEPAEncoder, JEPAPredictor
 from transformers import AutoTokenizer
@@ -51,18 +51,26 @@ def main(config = None):
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    dataset = load_dataset('humarin/chatgpt-paraphrases', split='train')
-    train_test = dataset.train_test_split(test_size=0.2, seed=seed)
-    test_valid = train_test['test'].train_test_split(test_size=0.5, seed=seed)
-
-    train_set = ParaphraseDataset(tokenizer, max_length=max_length, data=train_test['train'])
-    valid_set = ParaphraseDataset(tokenizer, max_length=max_length, data=test_valid['train'])
-    test_set = ParaphraseDataset(tokenizer, max_length=max_length, data=test_valid['test'])
+    # Use WikiAutoAssetDataset (Simplification Task) instead of ParaphraseDataset
+    print("Loading WikiAutoAssetDataset for Simplification Task...")
+    try:
+        train_set = WikiAutoAssetDataset(tokenizer, split='train', max_length=max_length)
+        valid_set = WikiAutoAssetDataset(tokenizer, split='validation', max_length=max_length)
+        # Try 'test_asset' for testing, fallback to validation if not found
+        try:
+            test_set = WikiAutoAssetDataset(tokenizer, split='test_asset', max_length=max_length)
+        except:
+            print("Warning: 'test_asset' split not found, using 'validation' for testing.")
+            test_set = WikiAutoAssetDataset(tokenizer, split='validation', max_length=max_length)
+    except Exception as e:
+        print(f"Failed to load WikiAutoAssetDataset: {e}")
+        return
 
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=num_workers, worker_init_fn=lambda worker_id: np.random.seed(seed + worker_id))
     valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=lambda worker_id: np.random.seed(seed + worker_id))
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=lambda worker_id: np.random.seed(seed + worker_id))
 
+    # Initialize ParaJEPA with bottleneck (default pred_hidden_dim=128 in class init)
     model = ParaJEPA(model_name=model_name, hidden_dim=hidden_dim, ema_decay=ema_decay, pred_depth=pred_depth).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 

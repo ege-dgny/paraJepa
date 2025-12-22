@@ -23,16 +23,24 @@ class JEPAEncoder(nn.Module):
         return cls_token
 
 class JEPAPredictor(nn.Module):
-    def __init__(self, input_dim=768, hidden_dim=384, output_dim=768, depth=3):
+    def __init__(self, input_dim=768, hidden_dim=128, output_dim=768, depth=3):
         super().__init__()
 
+        # hidden_dim defaults to 128 to act as a bottleneck if not specified otherwise
         layers = []
-        for _ in range(depth-1):
-            layers.append(nn.Linear(input_dim, hidden_dim))
+        
+        # First layer: input_dim -> hidden_dim (Compression)
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(nn.GELU())
+        
+        # Middle layers
+        for _ in range(depth-2):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.GELU())
-            input_dim = hidden_dim
 
+        # Last layer: hidden_dim -> output_dim (Expansion)
         layers.append(nn.Linear(hidden_dim, output_dim))
         self.layers = nn.Sequential(*layers)
     

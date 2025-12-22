@@ -9,7 +9,7 @@ import json
 import wandb
 
 class ParaJEPA(nn.Module):
-    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3):
+    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3, pred_hidden_dim=128):
         super().__init__()
         self.ema_decay = ema_decay
 
@@ -22,7 +22,7 @@ class ParaJEPA(nn.Module):
 
         self.predictor = JEPAPredictor(
             input_dim=hidden_dim,
-            hidden_dim=int(hidden_dim/2),
+            hidden_dim=pred_hidden_dim, # Bottleneck (e.g. 128)
             output_dim=hidden_dim,
             depth=pred_depth,
         )
@@ -35,7 +35,28 @@ class ParaJEPA(nn.Module):
 
         prediction = self.predictor(context_embeddings)
 
-        loss = F.mse_loss(prediction, target_embeddings)
+        loss_pred = F.mse_loss(prediction, target_embeddings)
+
+        # --- ANTI-COLLAPSE REGULARIZATION (VICReg-style) ---
+        # 1. Variance Loss: Force vectors to have variance > 1 (prevent point collapse)
+        std_pred = torch.sqrt(prediction.var(dim=0) + 0.0001)
+        std_target = torch.sqrt(target_embeddings.var(dim=0) + 0.0001)
+        std_loss = torch.mean(F.relu(1 - std_pred)) + torch.mean(F.relu(1 - std_target))
+
+        # 2. Covariance Loss: Force features to be uncorrelated (prevent dimensional collapse)
+        # This decorrelates the dimensions of the embedding
+        def off_diagonal(x):
+            n, m = x.shape
+            assert n == m
+            return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+
+        pred_norm = prediction - prediction.mean(dim=0)
+        cov_pred = (pred_norm.T @ pred_norm) / (prediction.size(0) - 1)
+        cov_loss = off_diagonal(cov_pred).pow_(2).sum() / prediction.size(1)
+
+        # Total Loss: Prediction + Lambda * Regularization
+        # Weights: 25.0 for variance, 1.0 for covariance (standard VICReg defaults)
+        loss = loss_pred + (25.0 * std_loss) + (1.0 * cov_loss)
 
         return loss, prediction, target_embeddings
     
