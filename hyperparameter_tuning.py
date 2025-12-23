@@ -20,13 +20,12 @@ import wandb
 import torch
 import torch.optim as optim
 from transformers import AutoTokenizer
-from datasets import load_dataset
 from torch.utils.data import DataLoader
 import random
 import numpy as np
 import os
 
-from dataload import ParaphraseDataset
+from dataload import WikiAutoAssetDataset
 from para_jepa_train import ParaJEPA, train_para_jepa
 from config import Config
 
@@ -129,16 +128,20 @@ def train(config=None, use_wandb=True):
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # Load and split dataset (same approach as main.py)
-    # The dataset doesn't have a test portion, so we create it manually
-    dataset = load_dataset('humarin/chatgpt-paraphrases', split='train')
-    train_test = dataset.train_test_split(test_size=0.2, seed=seed)  # 80% for train
-    test_valid = train_test['test'].train_test_split(test_size=0.5, seed=seed)  # 10% for vali, 10% for test
-    
-    # Create datasets (matching main.py structure)
-    train_set = ParaphraseDataset(tokenizer, max_length=max_length, data=train_test['train'])
-    valid_set = ParaphraseDataset(tokenizer, max_length=max_length, data=test_valid['train'])
-    test_set = ParaphraseDataset(tokenizer, max_length=max_length, data=test_valid['test'])
+    # Load WikiAuto/ASSET text simplification dataset (same as main.py)
+    # Use explicit splits provided by the dataset.
+    print("Loading WikiAutoAssetDataset for Simplification Task (hyperparameter tuning)...")
+    try:
+        train_set = WikiAutoAssetDataset(tokenizer, split='train', max_length=max_length)
+        valid_set = WikiAutoAssetDataset(tokenizer, split='validation', max_length=max_length)
+        try:
+            test_set = WikiAutoAssetDataset(tokenizer, split='test_asset', max_length=max_length)
+        except Exception:
+            print("Warning: 'test_asset' split not found, using 'validation' for testing in hyperparameter tuning.")
+            test_set = WikiAutoAssetDataset(tokenizer, split='validation', max_length=max_length)
+    except Exception as e:
+        print(f"Failed to load WikiAutoAssetDataset for hyperparameter tuning: {e}")
+        return
     
     # Create data loaders
     train_loader = DataLoader(

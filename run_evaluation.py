@@ -7,11 +7,10 @@ Usage:
 
 import torch
 from transformers import AutoTokenizer
-from datasets import load_dataset
 from torch.utils.data import DataLoader
 import numpy as np
 
-from dataload import ParaphraseDataset
+from dataload import WikiAutoAssetDataset
 from para_jepa_train import ParaJEPA
 from config import Config
 from evaluation_utils import run_full_evaluation, Evaluator
@@ -27,15 +26,20 @@ def main():
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     
-    # Load and split dataset (same as training)
-    dataset = load_dataset('humarin/chatgpt-paraphrases', split='train')
-    train_test = dataset.train_test_split(test_size=0.2, seed=seed)
-    test_valid = train_test['test'].train_test_split(test_size=0.5, seed=seed)
-    
-    # Create datasets
-    train_set = ParaphraseDataset(tokenizer, max_length=config.max_length, data=train_test['train'])
-    valid_set = ParaphraseDataset(tokenizer, max_length=config.max_length, data=test_valid['train'])
-    test_set = ParaphraseDataset(tokenizer, max_length=config.max_length, data=test_valid['test'])
+    # Load WikiAuto/ASSET text simplification dataset (same family as training)
+    # We mirror the splits used in main.py: train / validation / test_asset (with fallback).
+    print("Loading WikiAutoAssetDataset for Simplification Task (evaluation)...")
+    try:
+        train_set = WikiAutoAssetDataset(tokenizer, split='train', max_length=config.max_length)
+        valid_set = WikiAutoAssetDataset(tokenizer, split='validation', max_length=config.max_length)
+        try:
+            test_set = WikiAutoAssetDataset(tokenizer, split='test_asset', max_length=config.max_length)
+        except Exception:
+            print("Warning: 'test_asset' split not found, using 'validation' for testing in evaluation.")
+            test_set = WikiAutoAssetDataset(tokenizer, split='validation', max_length=config.max_length)
+    except Exception as e:
+        print(f"Failed to load WikiAutoAssetDataset for evaluation: {e}")
+        return
     
     # Create data loaders
     train_loader = DataLoader(
@@ -67,18 +71,11 @@ def main():
         print("Error: para_jepa_best_model.pt not found. Please train the model first.")
         return
     
-    # Get datasets for label extraction (optional but recommended)
-    train_dataset = train_test['train']
-    test_dataset = test_valid['test']
-    
     # Run full evaluation
     results = run_full_evaluation(
         model=model,
         train_loader=train_loader,
         test_loader=test_loader,
-        train_dataset=train_dataset,
-        test_dataset=test_dataset,
-        tokenizer=tokenizer,
         device=device,
         max_length=config.max_length
     )

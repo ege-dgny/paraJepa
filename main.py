@@ -1,4 +1,4 @@
-from dataload import ParaphraseDataset, WikiAutoAssetDataset
+from dataload import WikiAutoAssetDataset
 from para_jepa_train import ParaJEPA, train_para_jepa, test_run
 from JEPA_Models import JEPAEncoder, JEPAPredictor
 from transformers import AutoTokenizer
