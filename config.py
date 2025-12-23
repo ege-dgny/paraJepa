@@ -9,7 +9,7 @@ class Config:
     batch_size = 16
     learning_rate = 2e-5
     weight_decay = 0.01
-    epochs = 10
+    epochs = 3
     
     # Data hyperparameters
     max_length = 128

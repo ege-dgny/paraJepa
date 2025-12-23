@@ -1,0 +1,4 @@
+Model,Content Acc (↑),Style Acc (↓),Disentanglement (H-Mean),Recall@1
+RoBERTa (Frozen),1.0%,0.0%,0.020,1.0000
+SimCLR (Contrastive),1.0%,0.0%,0.020,1.0000
+ParaJEPA (Yours),1.0%,0.0%,0.020,1.0000

@@ -30,6 +30,19 @@ class Evaluator:
             return model.module
         return model
 
+    def _get_batch_embeddings(self, model, input_ids, attention_mask):
+        """Helper to get embeddings from different model types"""
+        # 1. Check for 'encode' method (Wrapper / Custom Interface)
+        if hasattr(model, 'encode'):
+            return model.encode(input_ids, attention_mask)
+        # 2. Check for 'context_encoder' (ParaJEPA)
+        elif hasattr(model, 'context_encoder'):
+            return model.context_encoder(input_ids, attention_mask)
+        # 3. Fallback: Assume model(input_ids, attention_mask) returns embeddings
+        # This handles simple cases, but users should prefer wrappers
+        else:
+            return model(input_ids, attention_mask)
+
     @torch.no_grad()
     def get_embeddings(self, model, dataloader, extract_from='content', return_labels=False):
         """
@@ -64,20 +77,28 @@ class Evaluator:
                 attention_mask = batch['style_attention_mask'].to(self.device)
             
             # Use context encoder to get embeddings
-            emb = model.context_encoder(input_ids, attention_mask)
+            emb = self._get_batch_embeddings(model, input_ids, attention_mask)
             embeddings.append(emb.cpu().numpy())
             
             if return_labels:
-                # Generate labels from batch indices and paraphrase info
-                # Style label: use batch index as proxy (each sample has different paraphrase)
+                # Generate labels from batch using text hashing if possible, or fallback to index
+                # Note: Index-based labels are unstable if shuffling is on!
+                # Ideally, dataloader should return labels or text.
+                # For now, we warn the user if this is used without a dataset.
                 batch_size = input_ids.shape[0]
-                style_labels = [batch_idx * batch_size + i for i in range(batch_size)]
-                labels_style.extend(style_labels)
                 
-                # Content label: use a hash of content text to group same content
-                # Since we don't have access to original text here, use batch index
-                # In practice, you'd want to modify dataloader to return content IDs
-                content_labels = [batch_idx * batch_size + i for i in range(batch_size)]
+                # Check if batch has 'text' or equivalent for hashing
+                if 'content_text' in batch: # Assuming we might add this to collate_fn later
+                     content_texts = batch['content_text']
+                     content_labels = [int(hashlib.md5(t.encode()).hexdigest()[:8], 16) for t in content_texts]
+                else:
+                    # FALLBACK: Use simple index, but this is BROKEN for shuffling
+                    # We will try to rely on get_embeddings_with_labels for probes instead
+                    content_labels = [batch_idx * batch_size + i for i in range(batch_size)]
+                
+                style_labels = [batch_idx * batch_size + i for i in range(batch_size)]
+                
+                labels_style.extend(style_labels)
                 labels_content.extend(content_labels)
 
         embeddings = np.vstack(embeddings)
@@ -116,10 +137,91 @@ class Evaluator:
         content_id_map = {}  # Map content text to unique ID
         style_id_map = {}    # Map paraphrase index to style ID
         
+        # Helper function to extract raw HF dataset item
+        def get_raw_item(dataset, idx):
+            """
+            Traverse through Subset/Wrapper layers to get the raw HuggingFace dataset item.
+            Handles: Subset(WikiAutoAssetDataset(HF)) -> HF
+            """
+            current = dataset
+            current_idx = idx
+            
+            # Step 1: Handle Subset - map index and get underlying dataset
+            if hasattr(current, 'indices') and hasattr(current, 'dataset'):
+                # This is a Subset from torch.utils.data
+                current_idx = current.indices[current_idx]
+                current = current.dataset
+            
+            # Step 2: Handle WikiAutoAssetDataset wrapper - get underlying HF dataset
+            if hasattr(current, 'dataset') and hasattr(current, '__getitem__'):
+                # Test if this is a wrapper by checking what __getitem__ returns
+                try:
+                    test_item = current[0] if len(current) > 0 else None
+                    if test_item is not None and isinstance(test_item, dict):
+                        if 'content_input_ids' in test_item or 'style_input_ids' in test_item:
+                            # This is the wrapper (returns tensors), go deeper
+                            if hasattr(current, 'dataset'):
+                                current = current.dataset
+                        elif 'source' in test_item or 'text' in test_item:
+                            # Already raw HF dataset, use it directly
+                            return current[current_idx]
+                except:
+                    # If test fails, try to access dataset attribute directly
+                    if hasattr(current, 'dataset'):
+                        current = current.dataset
+            
+            # Step 3: Try to access the final dataset
+            try:
+                item = current[current_idx]
+                if isinstance(item, dict):
+                    if 'source' in item or 'text' in item:
+                        # Success! We have the raw HF item
+                        return item
+            except:
+                pass
+            
+            # Fallback: return None (will use tensor decoding)
+            return None
+        
         for idx in tqdm(range(len(dataset)), desc="Processing dataset"):
-            item = dataset[idx]
-            content_text = item['text']
-            paraphrases = item['paraphrases']
+            # Try to get raw HF dataset item first
+            item = get_raw_item(dataset, idx)
+            
+            # If we couldn't get raw item, fall back to accessing dataset[idx] directly
+            if item is None:
+                item = dataset[idx]
+            
+            # Now process the item
+            if 'source' in item:
+                # This is WikiAutoAsset
+                content_text = item['source'] # Complex text
+                # Find simplifications
+                if 'references' in item and len(item['references']) > 0:
+                    paraphrases = item['references']
+                elif 'target' in item:
+                    paraphrases = [item['target']]
+                else:
+                    paraphrases = []
+            elif 'text' in item:
+                # This is the ChatGPT Paraphrase Dataset (Original)
+                content_text = item['text']
+                paraphrases = item.get('paraphrases', [])
+            else:
+                # Unknown format, try to guess or fail gracefully
+                # If we are here, it means we got the TENSOR dict from dataload.py
+                # We can't hash tensors to get content labels easily/consistently across epochs if they are transformed
+                # BUT, since we are stuck, let's try to decode the input_ids back to text?
+                # That requires tokenizer.
+                
+                if 'content_input_ids' in item:
+                    content_text = tokenizer.decode(item['content_input_ids'], skip_special_tokens=True)
+                    # For style, decode style_input_ids
+                    style_text = tokenizer.decode(item['style_input_ids'], skip_special_tokens=True)
+                    paraphrases = [style_text]
+                else:
+                    print(f"Warning: Unknown dataset format at index {idx}. Keys: {item.keys()}")
+                    continue
+            # -------------------------------------------
             
             # Generate content label (hash of original text)
             content_hash = int(hashlib.md5(content_text.encode()).hexdigest()[:8], 16)
@@ -155,7 +257,7 @@ class Evaluator:
             input_ids = enc['input_ids'].to(self.device)
             attention_mask = enc['attention_mask'].to(self.device)
             
-            emb = model.context_encoder(input_ids, attention_mask)
+            emb = self._get_batch_embeddings(model, input_ids, attention_mask)
             embeddings.append(emb.cpu().numpy())
             style_labels.append(style_label)
             content_labels.append(content_label)
@@ -331,7 +433,9 @@ def run_full_evaluation(model, train_loader, test_loader, train_dataset=None, te
             model, test_dataset, tokenizer, max_length=max_length, extract_from='content'
         )
     else:
-        # Use DataLoader-based extraction (labels will be approximate)
+        # Fallback to DataLoader, BUT we strongly warn this might be broken for probes
+        print("\nWARNING: Using DataLoader extraction without explicit text access.")
+        print("   If train_loader has shuffle=True, probe accuracy will be garbage.")
         print("\n1. Extracting embeddings from data loaders...")
         train_emb, train_style, train_content = evaluator.get_embeddings(
             model, train_loader, extract_from='content', return_labels=True
