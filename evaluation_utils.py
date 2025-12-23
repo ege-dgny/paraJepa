@@ -162,12 +162,9 @@ class Evaluator:
         
         return np.vstack(embeddings), np.array(style_labels), np.array(content_labels)
 
-    def linear_probe(self, train_embeddings, train_labels, test_embeddings, test_labels, task_name="Task"):
+    def linear_probe(self, train_embeddings, train_labels, test_embeddings, test_labels, task_name="Task", max_samples=10000):
         """
         Trains a simple logistic regression probe.
-        
-        If task_name == "Style Classification": We want LOW accuracy.
-        If task_name == "Content Classification": We want HIGH accuracy.
         
         Args:
             train_embeddings: Training embeddings (N, D)
@@ -175,17 +172,43 @@ class Evaluator:
             test_embeddings: Test embeddings (M, D)
             test_labels: Test labels (M,)
             task_name: Name of the task for logging
-        
-        Returns:
-            accuracy: Classification accuracy
+            max_samples: Maximum number of samples to use (to avoid memory issues)
         """
         print(f"--- Running Probe: {task_name} ---")
         
-        if len(np.unique(train_labels)) < 2:
-            print(f"Warning: Only {len(np.unique(train_labels))} unique labels found. Skipping probe.")
+        # Subsample if too many samples
+        if len(train_embeddings) > max_samples:
+            print(f"Subsampling from {len(train_embeddings)} to {max_samples} samples...")
+            indices = np.random.choice(len(train_embeddings), max_samples, replace=False)
+            train_embeddings = train_embeddings[indices]
+            train_labels = train_labels[indices]
+        
+        if len(test_embeddings) > max_samples:
+            indices = np.random.choice(len(test_embeddings), max_samples, replace=False)
+            test_embeddings = test_embeddings[indices]
+            test_labels = test_labels[indices]
+        
+        # Check unique labels
+        unique_labels = len(np.unique(train_labels))
+        if unique_labels < 2:
+            print(f"Warning: Only {unique_labels} unique labels found. Skipping probe.")
             return 0.0
         
-        clf = LogisticRegression(max_iter=1000, C=1.0, random_state=42)
+        # If too many classes, use a different approach
+        if unique_labels > 1000:
+            print(f"Warning: {unique_labels} unique labels found. Using multiclass with limited classes...")
+            # Keep only most common classes
+            from collections import Counter
+            label_counts = Counter(train_labels)
+            top_classes = [label for label, _ in label_counts.most_common(100)]
+            mask = np.isin(train_labels, top_classes)
+            train_embeddings = train_embeddings[mask]
+            train_labels = train_labels[mask]
+            mask = np.isin(test_labels, top_classes)
+            test_embeddings = test_embeddings[mask]
+            test_labels = test_labels[mask]
+        
+        clf = LogisticRegression(max_iter=1000, C=1.0, random_state=42, solver='lbfgs', n_jobs=1)
         clf.fit(train_embeddings, train_labels)
         
         preds = clf.predict(test_embeddings)
