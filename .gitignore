@@ -1,4 +1,11 @@
 /NLP_Proposal.pdf
 para_jepa_best_model.pt
+*.pt
 wandb/
 __pycache__/
+*.log
+reports/
+HYPERPARAMETER_TUNING_README.md
+*.png
+*.csv
+*.json
