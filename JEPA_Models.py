@@ -23,7 +23,7 @@ class JEPAEncoder(nn.Module):
         return cls_token
 
 class JEPAPredictor(nn.Module):
-    def __init__(self, input_dim=768, hidden_dim=256, output_dim=768, depth=3):
+    def __init__(self, input_dim=768, hidden_dim=16, output_dim=768, depth=3):
         super().__init__()
 
         # hidden_dim defaults to 128 to act as a bottleneck if not specified otherwise

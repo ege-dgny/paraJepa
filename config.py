@@ -4,6 +4,8 @@ class Config:
     hidden_dim = 768
     ema_decay = 0.99
     pred_depth = 3
+    pred_hidden_dim = 196
+    pred_dim = 16
     
     # Training hyperparameters
     batch_size = 16

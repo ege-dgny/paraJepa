@@ -56,7 +56,7 @@ class ParaJEPA(nn.Module):
 
         # Total Loss: Prediction + Lambda * Regularization
         # Weights: 25.0 for variance, 1.0 for covariance (standard VICReg defaults)
-        loss = loss_pred + (7.0 * std_loss) + (1.0 * cov_loss)
+        loss = loss_pred + (5.0 * std_loss) + (5.0 * cov_loss)
 
         return loss, prediction, target_embeddings
     
