@@ -1,17 +1,6 @@
-"""
-Masked JEPA Training Script
-
-This script trains ParaJEPA with token masking applied to the complex text (context input).
-Masking prevents the model from learning identity shortcuts and should enable better
-disentanglement even with larger bottleneck dimensions.
-
-Usage:
-    python main_masked.py
-"""
-
-from dataload import WikiAutoAssetMaskedDataset
-from para_jepa_train import ParaJEPA, train_para_jepa, test_run
-from JEPA_Models import JEPAEncoder, JEPAPredictor
+from src.dataload import WikiAutoAssetMaskedDataset
+from src.para_jepa_train import ParaJEPA, train_para_jepa, test_run
+from src.JEPA_Models import JEPAEncoder, JEPAPredictor
 from transformers import AutoTokenizer
 import torch
 import torch.optim as optim
@@ -25,14 +14,14 @@ from config import Config
 
 def get_device():
     if torch.backends.cuda.is_built() and torch.cuda.is_available():
-        print("Using CUDA")
+        print("Device: CUDA")
         device = torch.device('cuda')
     elif torch.backends.mps.is_built() and torch.backends.mps.is_available():
-        print("Using MPS")
+        print("Device: MPS")
         device = torch.device('mps')
     else:
         device = torch.device('cpu')
-        print("Using CPU (no GPU available)")
+        print("Device: CPU")
     return device
 
 def set_seed(seed=11):
@@ -66,10 +55,9 @@ def main(config=None):
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    # Use WikiAutoAssetMaskedDataset with masking enabled
-    print("="*60)
-    print("MASKED JEPA TRAINING")
-    print("="*60)
+    print("-" * 30)
+    print("Masked JEPA Training")
+    print("-" * 30)
     print(f"Masking Probability: {mask_prob}")
     print("Loading WikiAutoAssetMaskedDataset for Simplification Task...")
     
@@ -86,7 +74,6 @@ def main(config=None):
             max_length=max_length,
             mask_prob=mask_prob
         )
-        # Try 'test_asset' for testing, fallback to validation if not found
         try:
             test_set = WikiAutoAssetMaskedDataset(
                 tokenizer, 
@@ -128,7 +115,6 @@ def main(config=None):
         worker_init_fn=lambda worker_id: np.random.seed(seed + worker_id)
     )
 
-    # Initialize ParaJEPA with bottleneck
     model = ParaJEPA(
         model_name=model_name, 
         hidden_dim=hidden_dim, 
@@ -138,7 +124,6 @@ def main(config=None):
     ).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Train model
     train_para_jepa(
         model=model, 
         train_loader=train_loader, 
@@ -148,31 +133,27 @@ def main(config=None):
         epochs=epochs
     )
     
-    # Rename checkpoint to masked-specific name
     original_checkpoint = "para_jepa_best_model.pt"
     masked_checkpoint = "para_jepa_masked_best_model.pt"
     
     if os.path.exists(original_checkpoint):
         shutil.copy(original_checkpoint, masked_checkpoint)
-        print(f"\n✅ Checkpoint saved as: {masked_checkpoint}")
-        print(f"   (Original checkpoint also preserved as: {original_checkpoint})")
+        print(f"[INFO] Checkpoint saved as: {masked_checkpoint}")
+        print(f"[INFO] Original checkpoint preserved as: {original_checkpoint}")
     else:
-        print(f"\n⚠️ Warning: Checkpoint {original_checkpoint} not found after training.")
+        print(f"[WARN] Checkpoint {original_checkpoint} not found after training.")
     
-    # Run test evaluation
-    # Note: test_run will try to load para_jepa_best_model.pt, so we need to handle this
-    # For now, we'll manually load the masked checkpoint
-    print("\n" + "="*60)
-    print("RUNNING TEST EVALUATION")
-    print("="*60)
+    print("-" * 30)
+    print("Running Test Evaluation")
+    print("-" * 30)
     try:
         model.load_state_dict(torch.load(masked_checkpoint, map_location=device))
-        print(f"✅ Loaded masked checkpoint: {masked_checkpoint}")
+        print(f"[INFO] Loaded masked checkpoint: {masked_checkpoint}")
     except FileNotFoundError:
-        print(f"❌ Could not load {masked_checkpoint}")
+        print(f"[ERROR] Could not load {masked_checkpoint}")
         return
     
-    from para_jepa_train import evaluation
+    from src.para_jepa_train import evaluation
     test_loss, test_cosine_sim = evaluation(model, test_loader, device, desc="Test")
     print(f"\nTest Results:")
     print(f"  Test Loss: {test_loss:.4f}")
@@ -180,4 +161,3 @@ def main(config=None):
 
 if __name__ == '__main__':
     main()
-

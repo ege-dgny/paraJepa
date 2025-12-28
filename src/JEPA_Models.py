@@ -26,7 +26,6 @@ class JEPAPredictor(nn.Module):
     def __init__(self, input_dim=768, hidden_dim=16, output_dim=768, depth=3, funnel = False):
         super().__init__()
 
-        # hidden_dim defaults to 128 to act as a bottleneck if not specified otherwise
         if funnel:
             layers = []
             layers.append(nn.Linear(input_dim, 192))
@@ -44,22 +43,18 @@ class JEPAPredictor(nn.Module):
             layers.append(nn.Linear(12, output_dim))
             self.layers = nn.Sequential(*layers)
 
-
         else:
             layers = []
             
-            # First layer: input_dim -> hidden_dim (Compression)
             layers.append(nn.Linear(input_dim, hidden_dim))
             layers.append(nn.LayerNorm(hidden_dim))
             layers.append(nn.GELU())
             
-            # Middle layers
             for _ in range(depth-2):
                 layers.append(nn.Linear(hidden_dim, hidden_dim))
                 layers.append(nn.LayerNorm(hidden_dim))
                 layers.append(nn.GELU())
 
-            # Last layer: hidden_dim -> output_dim (Expansion)
             layers.append(nn.Linear(hidden_dim, output_dim))
             self.layers = nn.Sequential(*layers)
     

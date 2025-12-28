@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoConfig, AutoTokenizer
-from JEPA_Models import JEPAEncoder, JEPAPredictor
+from src.JEPA_Models import JEPAEncoder, JEPAPredictor
 import copy
 from tqdm import tqdm
 import json
@@ -13,16 +13,14 @@ class ParaJEPA(nn.Module):
         super().__init__()
         self.ema_decay = ema_decay
 
-        # initialize context encoder
         self.context_encoder = JEPAEncoder(model_name, hidden_dim)
-        #initialize target encoder (no gradient))
         self.target_encoder = copy.deepcopy(self.context_encoder)
         for p in self.target_encoder.parameters():
-            p.requires_grad = False #disable gradient update for target encoder
+            p.requires_grad = False
 
         self.predictor = JEPAPredictor(
             input_dim=hidden_dim,
-            hidden_dim=pred_hidden_dim, # Bottleneck (e.g. 128)
+            hidden_dim=pred_hidden_dim,
             output_dim=hidden_dim,
             depth=pred_depth,
             funnel=funnel,
@@ -38,14 +36,10 @@ class ParaJEPA(nn.Module):
 
         loss_pred = F.mse_loss(prediction, target_embeddings)
 
-        # --- ANTI-COLLAPSE REGULARIZATION (VICReg-style) ---
-        # 1. Variance Loss: Force vectors to have variance > 1 (prevent point collapse)
         std_pred = torch.sqrt(prediction.var(dim=0) + 0.0001)
         std_target = torch.sqrt(target_embeddings.var(dim=0) + 0.0001)
         std_loss = torch.mean(F.relu(1 - std_pred)) + torch.mean(F.relu(1 - std_target))
 
-        # 2. Covariance Loss: Force features to be uncorrelated (prevent dimensional collapse)
-        # This decorrelates the dimensions of the embedding
         def off_diagonal(x):
             n, m = x.shape
             assert n == m
@@ -55,8 +49,6 @@ class ParaJEPA(nn.Module):
         cov_pred = (pred_norm.T @ pred_norm) / (prediction.size(0) - 1)
         cov_loss = off_diagonal(cov_pred).pow_(2).sum() / prediction.size(1)
 
-        # Total Loss: Prediction + Lambda * Regularization
-        # Weights: 25.0 for variance, 1.0 for covariance (standard VICReg defaults)
         loss = loss_pred + (25.0 * std_loss) + (1.0 * cov_loss)
 
         return loss, prediction, target_embeddings
@@ -101,7 +93,7 @@ def train_para_jepa(model, train_loader, valid_loader, optimizer, device, epochs
     }
     
     for epoch in range(epochs):
-        print(f"starting epoch {epoch+1}/{epochs}")
+        print(f"Starting epoch {epoch+1}/{epochs}")
         model.train()
         total_loss = 0.0
         progress_bar = tqdm(train_loader, desc="Training")
@@ -143,7 +135,6 @@ def train_para_jepa(model, train_loader, valid_loader, optimizer, device, epochs
         training_history['val_cosine_sim'].append(val_cosine_sim)
         training_history['epochs'].append(epoch + 1)
         
-        # Log to W&B if enabled
         if use_wandb:
             wandb.log({
                 'epoch': epoch + 1,
@@ -153,11 +144,9 @@ def train_para_jepa(model, train_loader, valid_loader, optimizer, device, epochs
                 'best_val_loss': best_val_loss
             })
         
-        # Save history
         with open('training_history.json', 'w') as f:
             json.dump(training_history, f, indent=2)
 
-    # Return metrics for W&B
     return {
         'best_val_loss': best_val_loss,
         'final_train_loss': avg_loss,

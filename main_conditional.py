@@ -1,17 +1,6 @@
-"""
-Conditional JEPA Training Script
-
-This script trains ParaJEPAConditional, which explicitly feeds the target length
-to the predictor. This "explains away" the length information, forcing the
-context encoder to focus on semantics instead of acting as a length-identity-mapper.
-
-Usage:
-    python main_conditional.py
-"""
-
-from dataload import WikiAutoAssetDataset
-from para_jepa_conditional import ParaJEPAConditional
-from para_jepa_train import train_para_jepa
+from src.dataload import WikiAutoAssetDataset
+from src.para_jepa_conditional import ParaJEPAConditional
+from src.para_jepa_train import train_para_jepa
 from transformers import AutoTokenizer
 import torch
 import torch.optim as optim
@@ -24,14 +13,14 @@ from config import Config
 
 def get_device():
     if torch.backends.cuda.is_built() and torch.cuda.is_available():
-        print("Using CUDA")
+        print("Device: CUDA")
         device = torch.device('cuda')
     elif torch.backends.mps.is_built() and torch.backends.mps.is_available():
-        print("Using MPS")
+        print("Device: MPS")
         device = torch.device('mps')
     else:
         device = torch.device('cpu')
-        print("Using CPU (no GPU available)")
+        print("Device: CPU")
     return device
 
 def set_seed(seed=11):
@@ -58,17 +47,15 @@ def main(config=None):
     epochs = config.epochs
     max_length = config.max_length
     num_workers = config.num_workers
-    # Use a moderate bottleneck (128) to test if conditioning solves the identity mapping
-    # without needing extreme compression (8-dim)
     pred_hidden_dim = 128 
     seed = set_seed(config.seed)
     device = get_device()
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    print("="*60)
-    print("CONDITIONAL JEPA TRAINING")
-    print("="*60)
+    print("-" * 30)
+    print("Conditional JEPA Training")
+    print("-" * 30)
     print("Strategy: Feed Target Length to Predictor to 'Explain Away' Style")
     print(f"Bottleneck Dim: {pred_hidden_dim}")
     print("Loading WikiAutoAssetDataset...")
@@ -107,7 +94,6 @@ def main(config=None):
         worker_init_fn=lambda worker_id: np.random.seed(seed + worker_id)
     )
 
-    # Initialize ParaJEPAConditional
     model = ParaJEPAConditional(
         model_name=model_name, 
         hidden_dim=hidden_dim, 
@@ -118,8 +104,6 @@ def main(config=None):
     
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Train model
-    # We can reuse the standard train loop because the forward signature matches
     train_para_jepa(
         model=model, 
         train_loader=train_loader, 
@@ -129,28 +113,26 @@ def main(config=None):
         epochs=epochs
     )
     
-    # Rename checkpoint
     original_checkpoint = "para_jepa_best_model.pt"
     conditional_checkpoint = "para_jepa_conditional_best_model.pt"
     
     if os.path.exists(original_checkpoint):
         shutil.copy(original_checkpoint, conditional_checkpoint)
-        print(f"\n✅ Checkpoint saved as: {conditional_checkpoint}")
+        print(f"[INFO] Checkpoint saved as: {conditional_checkpoint}")
     else:
-        print(f"\n⚠️ Warning: Checkpoint {original_checkpoint} not found after training.")
+        print(f"[WARN] Checkpoint {original_checkpoint} not found after training.")
     
-    # Run test evaluation manually since we need to load the specific checkpoint class
-    print("\n" + "="*60)
-    print("RUNNING TEST EVALUATION")
-    print("="*60)
+    print("-" * 30)
+    print("Running Test Evaluation")
+    print("-" * 30)
     try:
         model.load_state_dict(torch.load(conditional_checkpoint, map_location=device))
-        print(f"✅ Loaded checkpoint: {conditional_checkpoint}")
+        print(f"[INFO] Loaded checkpoint: {conditional_checkpoint}")
     except FileNotFoundError:
-        print(f"❌ Could not load {conditional_checkpoint}")
+        print(f"[ERROR] Could not load {conditional_checkpoint}")
         return
     
-    from para_jepa_train import evaluation
+    from src.para_jepa_train import evaluation
     test_loss, test_cosine_sim = evaluation(model, test_loader, device, desc="Test")
     print(f"\nTest Results:")
     print(f"  Test Loss: {test_loss:.4f}")
@@ -158,4 +140,3 @@ def main(config=None):
 
 if __name__ == '__main__':
     main()
-
