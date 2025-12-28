@@ -1,4 +1,0 @@
-Model,Recall@1 (Content),Style Discrim Acc (↓)
-RoBERTa (Frozen),0.9359,67.3%
-SimCLR (Contrastive),1.0000,58.1%
-ParaJEPA (Yours),0.0056,50.0%
