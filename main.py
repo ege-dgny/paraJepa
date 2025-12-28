@@ -72,7 +72,7 @@ def main(config = None):
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, worker_init_fn=lambda worker_id: np.random.seed(seed + worker_id))
 
     # Initialize ParaJEPA with bottleneck (default pred_hidden_dim=128 in class init)
-    model = ParaJEPA(model_name=model_name, hidden_dim=hidden_dim, ema_decay=ema_decay, pred_depth=pred_depth, pred_hidden_dim=pred_hidden_dim).to(device)
+    model = ParaJEPA(model_name=model_name, hidden_dim=hidden_dim, ema_decay=ema_decay, pred_depth=pred_depth, pred_hidden_dim=pred_hidden_dim, funnel=True).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     train_para_jepa(

@@ -125,7 +125,8 @@ def main():
     parajepa = ParaJEPA(
         model_name=config.model_name,
         hidden_dim=config.hidden_dim,
-        pred_depth=config.pred_depth
+        pred_depth=config.pred_depth,
+        funnel=True
     )
     try:
         parajepa.load_state_dict(torch.load("para_jepa_best_model.pt", map_location=device))

@@ -9,7 +9,7 @@ import json
 import wandb
 
 class ParaJEPA(nn.Module):
-    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3, pred_hidden_dim=196):
+    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3, pred_hidden_dim=196, funnel=False):
         super().__init__()
         self.ema_decay = ema_decay
 
@@ -25,6 +25,7 @@ class ParaJEPA(nn.Module):
             hidden_dim=pred_hidden_dim, # Bottleneck (e.g. 128)
             output_dim=hidden_dim,
             depth=pred_depth,
+            funnel=funnel,
         )
     
     def forward(self, style_input, content_input):
@@ -56,7 +57,7 @@ class ParaJEPA(nn.Module):
 
         # Total Loss: Prediction + Lambda * Regularization
         # Weights: 25.0 for variance, 1.0 for covariance (standard VICReg defaults)
-        loss = loss_pred + (5.0 * std_loss) + (5.0 * cov_loss)
+        loss = loss_pred + (25.0 * std_loss) + (1.0 * cov_loss)
 
         return loss, prediction, target_embeddings
     

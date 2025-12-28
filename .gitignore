@@ -10,3 +10,10 @@ HYPERPARAMETER_TUNING_README.md
 *.csv
 *.json
 hugging_face.py
+*.pdf
+.DS_Store
+./reports
+./example_reports
+./oldLog
+./wandb
+./trials.txt

@@ -1,0 +1,3061 @@
+Trial 1: paraJEPA + Mean Pooling + Spherical Embeddings (L2 Normalization)
+
+Idea: Force the model to live on a Hypersphere
+
+Code: 
+# 1. Install Dependencies
+!pip install -q transformers datasets wandb textstat scikit-learn
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel, AutoTokenizer
+from datasets import load_dataset
+from google.colab import drive
+import copy
+from tqdm import tqdm
+import json
+import wandb
+import random
+import numpy as np
+import os
+
+# --- CONFIGURATION ---
+class Config:
+    model_name = 'roberta-base'
+    hidden_dim = 768
+    pred_depth = 3
+    pred_hidden_dim = 196
+    
+    # Training
+    batch_size = 16
+    learning_rate = 2e-5
+    epochs = 3 
+    weight_decay = 0.01
+    max_length = 128
+    seed = 42
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# --- DATASET ---
+class WikiAutoAssetDataset(Dataset):
+    def __init__(self, tokenizer, split="train", max_length=128, max_samples=None):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.split = split
+        
+        print(f"Loading {split} dataset...")
+        try:
+            self.dataset = load_dataset("GEM/wiki_auto_asset_turk", split=split)
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            self.dataset = []
+
+        if max_samples:
+            self.dataset = self.dataset.select(range(min(len(self.dataset), max_samples)))
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        complex_text = item['source']
+        
+        if self.split == 'train':
+            if 'target' in item: simple_text = item['target']
+            elif 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            else: simple_text = complex_text 
+        else:
+            if 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            elif 'target' in item: simple_text = item['target']
+            else: simple_text = complex_text
+        
+        style_enc = self.tokenizer(complex_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+        content_enc = self.tokenizer(simple_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+
+        return {
+            'style_input_ids': style_enc['input_ids'].squeeze(0),
+            'style_attention_mask': style_enc['attention_mask'].squeeze(0),
+            'content_input_ids': content_enc['input_ids'].squeeze(0),
+            'content_attention_mask': content_enc['attention_mask'].squeeze(0),
+        }
+
+# --- MODELS (Spherical JEPA) ---
+class JEPAEncoder(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(model_name)
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+    
+    def forward(self, input_ids, attention_mask):
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        token_embeddings = outputs.last_hidden_state
+
+        # Mean Pooling (Masked)
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mean_pooled = sum_embeddings / sum_mask
+
+        # Project & Normalize
+        projected = self.projection(mean_pooled)
+        spherical_embedding = F.normalize(projected, p=2, dim=1)
+        return spherical_embedding
+
+class JEPAPredictor(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=256, output_dim=768, depth=3):
+        super().__init__()
+        layers = [nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()]
+        for _ in range(depth-2):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()])
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.layers = nn.Sequential(*layers)
+    
+    def forward(self, x): return self.layers(x)
+
+class ParaJEPA(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3, pred_hidden_dim=196):
+        super().__init__()
+        self.ema_decay = ema_decay
+        self.context_encoder = JEPAEncoder(model_name, hidden_dim)
+        self.target_encoder = copy.deepcopy(self.context_encoder)
+        for p in self.target_encoder.parameters(): p.requires_grad = False
+        self.predictor = JEPAPredictor(input_dim=hidden_dim, hidden_dim=pred_hidden_dim, output_dim=hidden_dim, depth=pred_depth)
+    
+    def forward(self, style_input, content_input):
+        # 1. Encode
+        context_embeddings = self.context_encoder(style_input['input_ids'], style_input['attention_mask'])
+        with torch.no_grad():
+            target_embeddings = self.target_encoder(content_input['input_ids'], content_input['attention_mask'])
+        
+        # 2. Predict
+        raw_prediction = self.predictor(context_embeddings)
+        # --- FIX: FORCE SPHERICAL PREDICTION ---
+        prediction = F.normalize(raw_prediction, p=2, dim=1)
+        
+        # --- LOSS COMPONENT 1: Cosine Distance ---
+        # F.cosine_similarity is numerically stable
+        cos_sim = F.cosine_similarity(prediction, target_embeddings, dim=-1).mean()
+        loss_pred = 1.0 - cos_sim
+        
+        # --- LOSS COMPONENT 2: Covariance (Decorrelation) ---
+        def off_diagonal(x):
+            n, m = x.shape
+            return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+        
+        pred_norm = prediction - prediction.mean(dim=0)
+        cov_pred = (pred_norm.T @ pred_norm) / (prediction.size(0) - 1)
+        cov_loss = off_diagonal(cov_pred).pow_(2).sum() / prediction.size(1)
+
+        # Weighted Sum (Using the boosted weight 200.0)
+        loss = loss_pred + (200.0 * cov_loss)
+        
+        return loss, prediction, target_embeddings, loss_pred, cov_loss
+    
+    @torch.no_grad()
+    def update_target_ema(self):
+        for param, ema_param in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
+            ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
+
+# --- EXECUTION ---
+def main():
+    print(f"Using device: {Config.device}")
+    
+    # 1. LOGGING & DRIVE
+    wandb.login() # Ensure you are logged in
+    wandb.init(project="para-jepa-spherical", config=Config.__dict__)
+    
+    print("Mounting Google Drive...")
+    drive.mount('/content/drive')
+    drive_save_path = "/content/drive/MyDrive/ParaJEPA_Checkpoints"
+    os.makedirs(drive_save_path, exist_ok=True)
+    print(f"Checkpoints will be saved to: {drive_save_path}")
+
+    # Initialize components
+    tokenizer = AutoTokenizer.from_pretrained(Config.model_name)
+    model = ParaJEPA(Config.model_name, Config.hidden_dim, pred_depth=Config.pred_depth, pred_hidden_dim=Config.pred_hidden_dim).to(Config.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.learning_rate, weight_decay=Config.weight_decay)
+    
+    # Load Data 
+    print("Loading Data...")
+    train_set = WikiAutoAssetDataset(tokenizer, split='train', max_samples=50000) 
+    valid_set = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=2000)
+    
+    train_loader = DataLoader(train_set, batch_size=Config.batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_set, batch_size=Config.batch_size, shuffle=False)
+    
+    # Train Loop
+    print("Starting Training...")
+    best_loss = float('inf')
+    
+    for epoch in range(Config.epochs):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        
+        for batch in pbar:
+            s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+            c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+            
+            loss, _, _, loss_pred, cov_loss = model(s_in, c_in)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            model.update_target_ema()
+            
+            # --- LOGGING ---
+            wandb.log({
+                "train_loss": loss.item(), 
+                "cov_loss": cov_loss.item(), 
+                "pred_loss": loss_pred.item(),
+                "epoch": epoch
+            })
+            pbar.set_postfix({'loss': loss.item(), 'cov': cov_loss.item()})
+            
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in valid_loader:
+                s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+                c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+                loss, _, _, _, _ = model(s_in, c_in)
+                val_loss += loss.item()
+        
+        avg_val = val_loss / len(valid_loader)
+        print(f"Epoch {epoch+1} Val Loss: {avg_val:.4f}")
+        wandb.log({"val_loss": avg_val})
+        
+        # SAVE TO DRIVE LOGIC
+        if avg_val < best_loss:
+            best_loss = avg_val
+            drive_file = f"{drive_save_path}/para_jepa_best_model.pt"
+            torch.save(model.state_dict(), drive_file)
+            print(f"Checkpoint Saved to Drive: {drive_file}")
+
+    print("Training Complete.")
+    wandb.finish()
+
+if __name__ == "__main__":
+    main()
+
+Ran this code to evaluate collapse:
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer
+from torch.utils.data import DataLoader
+
+# --- 1. SETUP & RELOAD ---
+print("🔄 Setting up Diagnostic Environment...")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+tokenizer = AutoTokenizer.from_pretrained('roberta-base')
+
+# Re-initialize the model structure
+model = ParaJEPA(
+    model_name='roberta-base', 
+    hidden_dim=768, 
+    pred_depth=Config.pred_depth, 
+    pred_hidden_dim=Config.pred_hidden_dim
+).to(device)
+
+# Load the saved checkpoint from Drive
+drive_path = "/content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt"
+try:
+    print(f"📂 Loading checkpoint from: {drive_path}")
+    state_dict = torch.load(drive_path, map_location=device)
+    model.load_state_dict(state_dict)
+    print("✅ Model loaded successfully.")
+except FileNotFoundError:
+    print("❌ Checkpoint not found! loading untrained model for comparison (or check path).")
+except Exception as e:
+    print(f"⚠️ Error loading model: {e}")
+
+model.eval()
+
+# Load a tiny validation batch (just to get real data)
+print("📚 Loading validation sample...")
+val_dataset = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=100)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+# --- 2. THE DIAGNOSTIC FUNCTION ---
+def diagnose_collapse(model, dataloader, device):
+    print("\n" + "="*40)
+    print("🔎 RUNNING IDENTITY COLLAPSE FORENSICS")
+    print("="*40)
+    
+    batch = next(iter(dataloader))
+    
+    # Move inputs to device
+    style_inputs = {
+        'input_ids': batch['style_input_ids'].to(device),
+        'attention_mask': batch['style_attention_mask'].to(device),
+    }
+    content_inputs = {
+        'input_ids': batch['content_input_ids'].to(device),
+        'attention_mask': batch['content_attention_mask'].to(device),
+    }
+
+    with torch.no_grad():
+        # A. Encode Sources (Complex) and Targets (Simple)
+        input_emb = model.context_encoder(style_inputs['input_ids'], style_inputs['attention_mask'])
+        target_emb = model.target_encoder(content_inputs['input_ids'], content_inputs['attention_mask'])
+        
+        # B. Generate Prediction (Apply Bottleneck + Normalization)
+        raw_pred = model.predictor(input_emb)
+        prediction = F.normalize(raw_pred, p=2, dim=1)
+        
+        # --- METRICS CALCULATIONS ---
+        
+        # 1. Natural Similarity: How close is the Source to the Target naturally?
+        # (RoBERTa baseline is usually high, ~0.90-0.98)
+        baseline_sim = F.cosine_similarity(input_emb, target_emb, dim=-1)
+        
+        # 2. Model Performance: How close is Prediction to Target?
+        # (This is what you are training to maximize)
+        pred_target_sim = F.cosine_similarity(prediction, target_emb, dim=-1)
+        
+        # 3. Identity Score: How close is Prediction to the ORIGINAL Input?
+        # (If this is 1.0, the model is just copying input)
+        pred_input_sim = F.cosine_similarity(prediction, input_emb, dim=-1)
+        
+        # 4. Diversity Check: Standard Deviation of the batch
+        # (If < 0.01, all outputs are identical -> Point Collapse)
+        batch_std = prediction.std(dim=0).mean().item()
+
+        # --- REPORTING ---
+        print(f"📊 BATCH STATISTICS (N={len(baseline_sim)}):")
+        print(f"  1. Natural Similarity (Source <-> Target) : {baseline_sim.mean():.5f} (The Baseline)")
+        print(f"  2. Model Performance  (Pred   <-> Target) : {pred_target_sim.mean():.5f} (The Goal)")
+        print(f"  3. Identity Check     (Pred   <-> Source) : {pred_input_sim.mean():.5f} (The Trap)")
+        print(f"  4. Output Diversity   (Batch Std Dev)     : {batch_std:.5f}")
+        
+        print("\n🧐 DIAGNOSIS:")
+        avg_gain = pred_target_sim.mean() - baseline_sim.mean()
+        identity_score = pred_input_sim.mean()
+        
+        if batch_std < 0.01:
+            print("🚨 POINT COLLAPSE DETECTED: The model outputs the exact same vector for every input.")
+            
+        elif identity_score > 0.999:
+            print("🚨 IDENTITY COLLAPSE DETECTED: The model is acting as a perfect identity function (Copy-Paste).")
+            print("   It ignores the 'Simplification' task entirely.")
+            
+        elif avg_gain <= 0.0005:
+            print("⚠️ NO LEARNING: The model is not improving over the natural baseline.")
+            if identity_score > 0.98:
+                print("   It is extremely close to Identity Mapping.")
+                
+        else:
+            print(f"✅ LEARNING DETECTED: The model moves embeddings {avg_gain:.4f} closer to target.")
+            print(f"   Identity Score is {identity_score:.4f}, meaning it has deviated from the original text.")
+
+    return input_emb, target_emb, prediction
+
+# --- 3. EXECUTE ---
+input_e, target_e, pred_e = diagnose_collapse(model, val_loader, device)
+
+Results:========================================
+🔎 RUNNING IDENTITY COLLAPSE FORENSICS
+========================================
+📊 BATCH STATISTICS (N=32):
+  1. Natural Similarity (Source <-> Target) : 0.99988 (The Baseline)
+  2. Model Performance  (Pred   <-> Target) : 0.99996 (The Goal)
+  3. Identity Check     (Pred   <-> Source) : 0.99985 (The Trap)
+  4. Output Diversity   (Batch Std Dev)     : 0.00003
+
+🧐 DIAGNOSIS:
+🚨 POINT COLLAPSE DETECTED: The model outputs the exact same vector for every input.
+
+Outcome:
+
+This is a clear-cut case of Point Collapse.
+The Diagnosis
+Your model has collapsed because we removed the Variance Loss (std_loss).
+1. The Mechanism:
+    * In the previous step, I advised removing std_loss because demanding a standard deviation of 1.0 is impossible for unit vectors (which have a tiny natural deviation of ~0.036).
+    * The Mistake: By removing it entirely, we removed the "repulsion" force.
+    * The Collapse: Without a force pushing vectors apart, the model found the easiest mathematical loophole: Output the exact same vector for everything.
+    * Why? If the batch has zero variance (all identical), the Covariance Matrix is zero. So cov_loss becomes perfectly zero. The model "cheated" the decorrelation loss by destroying the data diversity.
+2. The Suspiciously High Similarity (0.99988):
+    * The fact that your "Natural Similarity" is 0.99988 confirms that RoBERTa is extremely anisotropic (all vectors point in the same direction).
+    * This makes the "Point Collapse" trap very deep. The model only needs to output the "average" vector to get a near-perfect score.
+
+Trial 2: Spherical Variance Loss (std_loss) to prevent collapse.
+
+Code:
+# 1. Install Dependencies
+!pip install -q transformers datasets wandb textstat scikit-learn
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel, AutoTokenizer
+from datasets import load_dataset
+from google.colab import drive
+import copy
+from tqdm import tqdm
+import json
+import wandb
+import random
+import numpy as np
+import os
+
+# --- CONFIGURATION ---
+class Config:
+    model_name = 'roberta-base'
+    hidden_dim = 768
+    pred_depth = 3
+    pred_hidden_dim = 196
+    
+    # Training
+    batch_size = 16
+    learning_rate = 2e-5
+    epochs = 5  # Increased slightly for 5k samples
+    weight_decay = 0.01
+    max_length = 128
+    seed = 42
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# --- DATASET ---
+class WikiAutoAssetDataset(Dataset):
+    def __init__(self, tokenizer, split="train", max_length=128, max_samples=None):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.split = split
+        
+        print(f"Loading {split} dataset...")
+        try:
+            self.dataset = load_dataset("GEM/wiki_auto_asset_turk", split=split)
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            self.dataset = []
+
+        if max_samples:
+            self.dataset = self.dataset.select(range(min(len(self.dataset), max_samples)))
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        complex_text = item['source']
+        
+        if self.split == 'train':
+            if 'target' in item: simple_text = item['target']
+            elif 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            else: simple_text = complex_text 
+        else:
+            if 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            elif 'target' in item: simple_text = item['target']
+            else: simple_text = complex_text
+        
+        style_enc = self.tokenizer(complex_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+        content_enc = self.tokenizer(simple_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+
+        return {
+            'style_input_ids': style_enc['input_ids'].squeeze(0),
+            'style_attention_mask': style_enc['attention_mask'].squeeze(0),
+            'content_input_ids': content_enc['input_ids'].squeeze(0),
+            'content_attention_mask': content_enc['attention_mask'].squeeze(0),
+        }
+
+# --- MODELS (Spherical JEPA) ---
+class JEPAEncoder(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(model_name)
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+    
+    def forward(self, input_ids, attention_mask):
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        token_embeddings = outputs.last_hidden_state
+
+        # Mean Pooling (Masked)
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mean_pooled = sum_embeddings / sum_mask
+
+        # Project & Normalize
+        projected = self.projection(mean_pooled)
+        spherical_embedding = F.normalize(projected, p=2, dim=1)
+        return spherical_embedding
+
+class JEPAPredictor(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=256, output_dim=768, depth=3):
+        super().__init__()
+        layers = [nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()]
+        for _ in range(depth-2):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()])
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.layers = nn.Sequential(*layers)
+    
+    def forward(self, x): return self.layers(x)
+
+class ParaJEPA(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3, pred_hidden_dim=196):
+        super().__init__()
+        self.ema_decay = ema_decay
+        self.context_encoder = JEPAEncoder(model_name, hidden_dim)
+        self.target_encoder = copy.deepcopy(self.context_encoder)
+        for p in self.target_encoder.parameters(): p.requires_grad = False
+        self.predictor = JEPAPredictor(input_dim=hidden_dim, hidden_dim=pred_hidden_dim, output_dim=hidden_dim, depth=pred_depth)
+    
+    def forward(self, style_input, content_input):
+        # 1. Encode
+        context_embeddings = self.context_encoder(style_input['input_ids'], style_input['attention_mask'])
+        with torch.no_grad():
+            target_embeddings = self.target_encoder(content_input['input_ids'], content_input['attention_mask'])
+        
+        # 2. Predict (Force Sphere to prevent Magnitude Collapse)
+        raw_prediction = self.predictor(context_embeddings)
+        prediction = F.normalize(raw_prediction, p=2, dim=1)
+        
+        # --- LOSS 1: Cosine Distance ---
+        cos_sim = F.cosine_similarity(prediction, target_embeddings, dim=-1).mean()
+        loss_pred = 1.0 - cos_sim
+        
+        # --- LOSS 2: Covariance (Decorrelation) ---
+        def off_diagonal(x):
+            n, m = x.shape
+            return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+        
+        pred_norm = prediction - prediction.mean(dim=0)
+        cov_pred = (pred_norm.T @ pred_norm) / (prediction.size(0) - 1)
+        cov_loss = off_diagonal(cov_pred).pow_(2).sum() / prediction.size(1)
+
+        # --- LOSS 3: Spherical Variance (The Anti-Collapse Fix) ---
+        # Theoretical std for unit vectors in 768-dim is ~0.036
+        # We enforce a hinge at 0.03 to ensure batch diversity
+        std_pred = torch.sqrt(prediction.var(dim=0) + 1e-4)
+        std_loss = torch.mean(F.relu(0.03 - std_pred))
+
+        # Total Loss
+        # Weights: Pred=1.0, Cov=200.0 (Unit Vector Scaling), Std=100.0 (Collapse Prevention)
+        loss = loss_pred + (200.0 * cov_loss) + (100.0 * std_loss)
+        
+        # Return components for logging
+        return loss, prediction, target_embeddings, loss_pred, cov_loss, std_loss
+    
+    @torch.no_grad()
+    def update_target_ema(self):
+        for param, ema_param in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
+            ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
+
+# --- EXECUTION ---
+def main():
+    print(f"Using device: {Config.device}")
+    
+    # 1. LOGGING & DRIVE
+    wandb.login()
+    wandb.init(project="para-jepa-spherical-fixed", config=Config.__dict__)
+    
+    print("Mounting Google Drive...")
+    drive.mount('/content/drive')
+    drive_save_path = "/content/drive/MyDrive/ParaJEPA_Checkpoints"
+    os.makedirs(drive_save_path, exist_ok=True)
+    print(f"Checkpoints will be saved to: {drive_save_path}")
+
+    # Initialize components
+    tokenizer = AutoTokenizer.from_pretrained(Config.model_name)
+    model = ParaJEPA(Config.model_name, Config.hidden_dim, pred_depth=Config.pred_depth, pred_hidden_dim=Config.pred_hidden_dim).to(Config.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.learning_rate, weight_decay=Config.weight_decay)
+    
+    # Load Data (Fast Run: 5000 Samples)
+    print("Loading Data...")
+    train_set = WikiAutoAssetDataset(tokenizer, split='train', max_samples=5000) 
+    valid_set = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=500)
+    
+    train_loader = DataLoader(train_set, batch_size=Config.batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_set, batch_size=Config.batch_size, shuffle=False)
+    
+    # Train Loop
+    print("Starting Training...")
+    best_loss = float('inf')
+    
+    for epoch in range(Config.epochs):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        
+        for batch in pbar:
+            s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+            c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+            
+            # Unpack all 6 return values
+            loss, _, _, loss_pred, cov_loss, std_loss = model(s_in, c_in)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            model.update_target_ema()
+            
+            # --- LOGGING ---
+            wandb.log({
+                "train_loss": loss.item(), 
+                "pred_loss": loss_pred.item(),
+                "cov_loss": cov_loss.item(), 
+                "std_loss": std_loss.item(), # Monitor this!
+                "epoch": epoch
+            })
+            pbar.set_postfix({'loss': loss.item(), 'std': std_loss.item()})
+            
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in valid_loader:
+                s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+                c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+                loss, _, _, _, _, _ = model(s_in, c_in)
+                val_loss += loss.item()
+        
+        avg_val = val_loss / len(valid_loader)
+        print(f"Epoch {epoch+1} Val Loss: {avg_val:.4f}")
+        wandb.log({"val_loss": avg_val})
+        
+        if avg_val < best_loss:
+            best_loss = avg_val
+            drive_file = f"{drive_save_path}/para_jepa_best_model.pt"
+            torch.save(model.state_dict(), drive_file)
+            print(f"Checkpoint Saved: {drive_file}")
+
+    print("Training Complete.")
+    wandb.finish()
+
+if __name__ == "__main__":
+    main()
+
+Result:
+Loading Data...
+Loading train dataset...
+Loading validation dataset...
+Starting Training...
+Epoch 1: 100%|██████████| 313/313 [02:35<00:00, 2.01it/s, loss=0.907, std=0.00261]
+
+Epoch 1 Val Loss: 1.6924
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Epoch 2: 100%|██████████| 313/313 [02:34<00:00, 2.03it/s, loss=0.769, std=0.00258]
+
+Epoch 2 Val Loss: 1.5724
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Epoch 3: 100%|██████████| 313/313 [02:34<00:00, 2.02it/s, loss=0.708, std=0.00216]
+
+Epoch 3 Val Loss: 1.5116
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Epoch 4: 100%|██████████| 313/313 [02:34<00:00, 2.03it/s, loss=0.605, std=0.0014]
+
+Epoch 4 Val Loss: 1.4749
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Epoch 5: 100%|██████████| 313/313 [02:34<00:00, 2.02it/s, loss=0.547, std=0.00154]
+
+Epoch 5 Val Loss: 1.4149
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Training Complete.
+
+
+📂 Loading checkpoint from: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+✅ Model loaded successfully.
+📚 Loading validation sample...
+Loading validation dataset...
+
+========================================
+🔎 RUNNING IDENTITY COLLAPSE FORENSICS
+========================================
+📊 BATCH STATISTICS (N=32):
+1. Natural Similarity (Source <-> Target) : 0.93227 (The Baseline)
+2. Model Performance (Pred <-> Target) : 0.62242 (The Goal)
+3. Identity Check (Pred <-> Source) : 0.64031 (The Trap)
+4. Output Diversity (Batch Std Dev) : 0.02462
+
+🧐 DIAGNOSIS:
+⚠️ NO LEARNING: The model is not improving over the natural baseline.
+
+Outcome:
+
+This "No Learning" result confirms that we over-corrected.
+The Problem: The "Shape" Conflict
+* The Targets (RoBERTa): Your target embeddings come from a pre-trained RoBERTa model. Because of RoBERTa's "Cone Effect," these vectors naturally live in a very tight, clumped space. Their natural standard deviation is likely very small (e.g., 0.005).
+* The Constraint (Our Loss): We forced the Predictor to have a standard deviation of 0.03 (the theoretical sphere).
+* The Conflict: The model is trying to match the Targets (clumped) but is getting punished unless it puffs out the predictions (spherical). It physically cannot do both. It chose to satisfy the regularization (Output Diversity 0.024, close to 0.03) at the expense of matching the target (Similarity dropped to 0.62).
+
+So, I ran this:
+
+def check_target_stats(model, dataloader, device):
+    batch = next(iter(dataloader))
+    c_in = {
+        'input_ids': batch['content_input_ids'].to(device),
+        'attention_mask': batch['content_attention_mask'].to(device),
+    }
+    
+    with torch.no_grad():
+        target_emb = model.target_encoder(c_in['input_ids'], c_in['attention_mask'])
+        
+        # Calculate the actual Standard Deviation of the Targets
+        target_std = torch.sqrt(target_emb.var(dim=0) + 1e-4).mean().item()
+        
+        print(f"📉 Natural Target Std Dev: {target_std:.5f}")
+        print(f"🔧 Current Threshold:      0.03000")
+        
+        if target_std < 0.03:
+            print("🚨 MISMATCH DETECTED: We are forcing the model to be 'puffier' than the targets.")
+            print(f"   Recommendation: Set var_threshold to {target_std * 0.8:.5f}")
+train_set = WikiAutoAssetDataset(tokenizer, split='train', max_samples=5000) 
+valid_set = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=500)
+
+train_loader = DataLoader(train_set, batch_size=Config.batch_size, shuffle=True)
+valid_loader = DataLoader(valid_set, batch_size=Config.batch_size, shuffle=False)
+
+check_target_stats(model, train_loader, Config.device)
+
+And this is the output:
+
+Loading train dataset...
+Loading validation dataset...
+📉 Natural Target Std Dev: 0.02387
+🔧 Current Threshold:      0.03000
+🚨 MISMATCH DETECTED: We are forcing the model to be 'puffier' than the targets.
+   Recommendation: Set var_threshold to 0.01910
+
+Trial 3: Matching var_threshold
+
+Code:
+
+# 1. Install Dependencies
+!pip install -q transformers datasets wandb textstat scikit-learn
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel, AutoTokenizer
+from datasets import load_dataset
+from google.colab import drive
+import copy
+from tqdm import tqdm
+import json
+import wandb
+import random
+import numpy as np
+import os
+
+# --- CONFIGURATION ---
+class Config:
+    model_name = 'roberta-base'
+    hidden_dim = 768
+    pred_depth = 3
+    pred_hidden_dim = 196
+    
+    # Training
+    batch_size = 16
+    learning_rate = 2e-5
+    epochs = 5
+    weight_decay = 0.01
+    max_length = 128
+    seed = 42
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# --- DATASET ---
+class WikiAutoAssetDataset(Dataset):
+    def __init__(self, tokenizer, split="train", max_length=128, max_samples=None):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.split = split
+        
+        print(f"Loading {split} dataset...")
+        try:
+            self.dataset = load_dataset("GEM/wiki_auto_asset_turk", split=split)
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            self.dataset = []
+
+        if max_samples:
+            self.dataset = self.dataset.select(range(min(len(self.dataset), max_samples)))
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        complex_text = item['source']
+        
+        if self.split == 'train':
+            if 'target' in item: simple_text = item['target']
+            elif 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            else: simple_text = complex_text 
+        else:
+            if 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            elif 'target' in item: simple_text = item['target']
+            else: simple_text = complex_text
+        
+        style_enc = self.tokenizer(complex_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+        content_enc = self.tokenizer(simple_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+
+        return {
+            'style_input_ids': style_enc['input_ids'].squeeze(0),
+            'style_attention_mask': style_enc['attention_mask'].squeeze(0),
+            'content_input_ids': content_enc['input_ids'].squeeze(0),
+            'content_attention_mask': content_enc['attention_mask'].squeeze(0),
+        }
+
+# --- MODELS (Spherical JEPA) ---
+class JEPAEncoder(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(model_name)
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+    
+    def forward(self, input_ids, attention_mask):
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        token_embeddings = outputs.last_hidden_state
+
+        # Mean Pooling (Masked)
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mean_pooled = sum_embeddings / sum_mask
+
+        # Project & Normalize
+        projected = self.projection(mean_pooled)
+        spherical_embedding = F.normalize(projected, p=2, dim=1)
+        return spherical_embedding
+
+class JEPAPredictor(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=256, output_dim=768, depth=3):
+        super().__init__()
+        layers = [nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()]
+        for _ in range(depth-2):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()])
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.layers = nn.Sequential(*layers)
+    
+    def forward(self, x): return self.layers(x)
+
+class ParaJEPA(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3, pred_hidden_dim=196):
+        super().__init__()
+        self.ema_decay = ema_decay
+        self.context_encoder = JEPAEncoder(model_name, hidden_dim)
+        self.target_encoder = copy.deepcopy(self.context_encoder)
+        for p in self.target_encoder.parameters(): p.requires_grad = False
+        self.predictor = JEPAPredictor(input_dim=hidden_dim, hidden_dim=pred_hidden_dim, output_dim=hidden_dim, depth=pred_depth)
+    
+    def forward(self, style_input, content_input):
+        # 1. Encode
+        context_embeddings = self.context_encoder(style_input['input_ids'], style_input['attention_mask'])
+        with torch.no_grad():
+            target_embeddings = self.target_encoder(content_input['input_ids'], content_input['attention_mask'])
+        
+        # 2. Predict (Force Sphere)
+        raw_prediction = self.predictor(context_embeddings)
+        prediction = F.normalize(raw_prediction, p=2, dim=1)
+        
+        # --- LOSS 1: Cosine Distance ---
+        cos_sim = F.cosine_similarity(prediction, target_embeddings, dim=-1).mean()
+        loss_pred = 1.0 - cos_sim
+        
+        # --- LOSS 2: Covariance (Decorrelation) ---
+        def off_diagonal(x):
+            n, m = x.shape
+            return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+        
+        pred_norm = prediction - prediction.mean(dim=0)
+        cov_pred = (pred_norm.T @ pred_norm) / (prediction.size(0) - 1)
+        cov_loss = off_diagonal(cov_pred).pow_(2).sum() / prediction.size(1)
+
+        # --- LOSS 3: Spherical Variance (TUNED GUARDRAIL) ---
+        # Natural Target Std = 0.0238.
+        # We set threshold to 0.018.
+        # If std > 0.018 (Healthy), loss is 0.
+        # If std < 0.018 (Collapse), loss kicks in.
+        var_threshold = 0.018
+        
+        std_pred = torch.sqrt(prediction.var(dim=0) + 1e-4)
+        std_loss = torch.mean(F.relu(var_threshold - std_pred))
+
+        # Total Loss
+        # Weights: 
+        # - Pred: 1.0
+        # - Cov: 200.0 (Unit vector scaling)
+        # - Std: 25.0 (Safety net, low weight so it doesn't fight learning)
+        loss = loss_pred + (200.0 * cov_loss) + (25.0 * std_loss)
+        
+        return loss, prediction, target_embeddings, loss_pred, cov_loss, std_loss
+    
+    @torch.no_grad()
+    def update_target_ema(self):
+        for param, ema_param in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
+            ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
+
+# --- EXECUTION ---
+def main():
+    print(f"Using device: {Config.device}")
+    
+    # 1. LOGGING & DRIVE
+    wandb.login()
+    wandb.init(project="para-jepa-spherical-final", config=Config.__dict__)
+    
+    print("Mounting Google Drive...")
+    drive.mount('/content/drive')
+    drive_save_path = "/content/drive/MyDrive/ParaJEPA_Checkpoints"
+    os.makedirs(drive_save_path, exist_ok=True)
+    print(f"Checkpoints will be saved to: {drive_save_path}")
+
+    # Initialize components
+    tokenizer = AutoTokenizer.from_pretrained(Config.model_name)
+    model = ParaJEPA(Config.model_name, Config.hidden_dim, pred_depth=Config.pred_depth, pred_hidden_dim=Config.pred_hidden_dim).to(Config.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.learning_rate, weight_decay=Config.weight_decay)
+    
+    # Load Data (Fast Run: 5000 Samples)
+    print("Loading Data...")
+    train_set = WikiAutoAssetDataset(tokenizer, split='train', max_samples=5000) 
+    valid_set = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=500)
+    
+    train_loader = DataLoader(train_set, batch_size=Config.batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_set, batch_size=Config.batch_size, shuffle=False)
+    
+    # Train Loop
+    print("Starting Training...")
+    best_loss = float('inf')
+    
+    for epoch in range(Config.epochs):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        
+        for batch in pbar:
+            s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+            c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+            
+            # Unpack all 6 return values
+            loss, _, _, loss_pred, cov_loss, std_loss = model(s_in, c_in)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            model.update_target_ema()
+            
+            # --- LOGGING ---
+            wandb.log({
+                "train_loss": loss.item(), 
+                "pred_loss": loss_pred.item(),
+                "cov_loss": cov_loss.item(), 
+                "std_loss": std_loss.item(),
+                "epoch": epoch
+            })
+            pbar.set_postfix({'loss': loss.item(), 'std': std_loss.item()})
+            
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in valid_loader:
+                s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+                c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+                loss, _, _, _, _, _ = model(s_in, c_in)
+                val_loss += loss.item()
+        
+        avg_val = val_loss / len(valid_loader)
+        print(f"Epoch {epoch+1} Val Loss: {avg_val:.4f}")
+        wandb.log({"val_loss": avg_val})
+        
+        if avg_val < best_loss:
+            best_loss = avg_val
+            drive_file = f"{drive_save_path}/para_jepa_best_model.pt"
+            torch.save(model.state_dict(), drive_file)
+            print(f"Checkpoint Saved: {drive_file}")
+
+    print("Training Complete.")
+    wandb.finish()
+
+if __name__ == "__main__":
+    main()
+
+Results:Loading Data...
+Loading train dataset...
+Loading validation dataset...
+Starting Training...
+Epoch 1: 100%|██████████| 313/313 [02:35<00:00, 2.02it/s, loss=0.193, std=0.00164]
+
+Epoch 1 Val Loss: 0.2792
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Epoch 2: 100%|██████████| 313/313 [02:34<00:00, 2.03it/s, loss=0.133, std=0.0011]
+
+Epoch 2 Val Loss: 0.2363
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Epoch 3: 100%|██████████| 313/313 [02:34<00:00, 2.03it/s, loss=0.136, std=0.00106]
+
+Epoch 3 Val Loss: 0.2247
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Epoch 4: 100%|██████████| 313/313 [02:34<00:00, 2.03it/s, loss=0.123, std=0.00104]
+
+Epoch 4 Val Loss: 0.2108
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Epoch 5: 100%|██████████| 313/313 [02:34<00:00, 2.03it/s, loss=0.11, std=0.000879]
+
+Epoch 5 Val Loss: 0.1966
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Training Complete.
+
+🔄 Setting up Diagnostic Environment...
+
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+📂 Loading checkpoint from: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+✅ Model loaded successfully.
+📚 Loading validation sample...
+Loading validation dataset...
+
+========================================
+🔎 RUNNING IDENTITY COLLAPSE FORENSICS
+========================================
+📊 BATCH STATISTICS (N=32):
+1. Natural Similarity (Source <-> Target) : 0.98490 (The Baseline)
+2. Model Performance (Pred <-> Target) : 0.91472 (The Goal)
+3. Identity Check (Pred <-> Source) : 0.91646 (The Trap)
+4. Output Diversity (Batch Std Dev) : 0.01382
+
+🧐 DIAGNOSIS:
+⚠️ NO LEARNING: The model is not improving over the natural baseline.
+
+Outcome:
+
+This is a classic case of "Over-Regularization."
+The diagnostic tells the story clearly:
+* The Baseline (0.985): The Source and Target are naturally extremely close.
+* The Model (0.915): The model is actively pushing the prediction away from the Target.
+Why?
+The weights I suggested previously (Covariance=200.0, Variance=25.0) were too aggressive.
+* The model is being screamed at to "Decorrelate!" (cov_loss) and "Spread Out!" (std_loss).
+* To satisfy these demands, it is distorting the embeddings so much that they no longer look like the Target.
+* It is prioritizing "Good Statistics" (Variance/Covariance) over "Correct Prediction" (Cosine Similarity).
+The Solution:
+We need to flip the priority. The main task (Prediction) must be King; the Regularization should be the Advisor. We will drastically cut the weights and lower the variance threshold to be a "safety net" rather than a "driver."
+Updated Configuration (The "Soft" Constraint)
+* cov_loss: Reduce from 200.0 $\to$ 5.0. (We want disentanglement, but not if it destroys accuracy).
+* std_loss: Reduce from 25.0 $\to$ 5.0. (Stop fighting the natural cluster).
+* var_threshold: Reduce from 0.018 $\to$ 0.01. (Let the model be tighter if it needs to be).
+
+
+Trial 4: Updated configuration
+
+Code:
+
+# 1. Install Dependencies
+!pip install -q transformers datasets wandb textstat scikit-learn
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel, AutoTokenizer
+from datasets import load_dataset
+from google.colab import drive
+import copy
+from tqdm import tqdm
+import json
+import wandb
+import random
+import numpy as np
+import os
+
+# --- CONFIGURATION ---
+class Config:
+    model_name = 'roberta-base'
+    hidden_dim = 768
+    pred_depth = 3
+    pred_hidden_dim = 196
+    
+    # Training
+    batch_size = 16
+    learning_rate = 2e-5
+    epochs = 5
+    weight_decay = 0.01
+    max_length = 128
+    seed = 42
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# --- DATASET ---
+class WikiAutoAssetDataset(Dataset):
+    def __init__(self, tokenizer, split="train", max_length=128, max_samples=None):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.split = split
+        
+        print(f"Loading {split} dataset...")
+        try:
+            self.dataset = load_dataset("GEM/wiki_auto_asset_turk", split=split)
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            self.dataset = []
+
+        if max_samples:
+            self.dataset = self.dataset.select(range(min(len(self.dataset), max_samples)))
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        complex_text = item['source']
+        
+        if self.split == 'train':
+            if 'target' in item: simple_text = item['target']
+            elif 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            else: simple_text = complex_text 
+        else:
+            if 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            elif 'target' in item: simple_text = item['target']
+            else: simple_text = complex_text
+        
+        style_enc = self.tokenizer(complex_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+        content_enc = self.tokenizer(simple_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+
+        return {
+            'style_input_ids': style_enc['input_ids'].squeeze(0),
+            'style_attention_mask': style_enc['attention_mask'].squeeze(0),
+            'content_input_ids': content_enc['input_ids'].squeeze(0),
+            'content_attention_mask': content_enc['attention_mask'].squeeze(0),
+        }
+
+# --- MODELS (Spherical JEPA) ---
+class JEPAEncoder(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(model_name)
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+        )
+    
+    def forward(self, input_ids, attention_mask):
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        token_embeddings = outputs.last_hidden_state
+
+        # Mean Pooling (Masked)
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mean_pooled = sum_embeddings / sum_mask
+
+        # Project & Normalize
+        projected = self.projection(mean_pooled)
+        spherical_embedding = F.normalize(projected, p=2, dim=1)
+        return spherical_embedding
+
+class JEPAPredictor(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=256, output_dim=768, depth=3):
+        super().__init__()
+        layers = [nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()]
+        for _ in range(depth-2):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()])
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.layers = nn.Sequential(*layers)
+    
+    def forward(self, x): return self.layers(x)
+
+class ParaJEPA(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3, pred_hidden_dim=196):
+        super().__init__()
+        self.ema_decay = ema_decay
+        self.context_encoder = JEPAEncoder(model_name, hidden_dim)
+        self.target_encoder = copy.deepcopy(self.context_encoder)
+        for p in self.target_encoder.parameters(): p.requires_grad = False
+        self.predictor = JEPAPredictor(input_dim=hidden_dim, hidden_dim=pred_hidden_dim, output_dim=hidden_dim, depth=pred_depth)
+    
+    def forward(self, style_input, content_input):
+        # 1. Encode
+        context_embeddings = self.context_encoder(style_input['input_ids'], style_input['attention_mask'])
+        with torch.no_grad():
+            target_embeddings = self.target_encoder(content_input['input_ids'], content_input['attention_mask'])
+        
+        # 2. Predict (Force Sphere)
+        raw_prediction = self.predictor(context_embeddings)
+        prediction = F.normalize(raw_prediction, p=2, dim=1)
+        
+        # --- LOSS 1: Cosine Distance (MAIN TASK) ---
+        cos_sim = F.cosine_similarity(prediction, target_embeddings, dim=-1).mean()
+        loss_pred = 1.0 - cos_sim
+        
+        # --- LOSS 2: Covariance (Decorrelation) ---
+        def off_diagonal(x):
+            n, m = x.shape
+            return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+        
+        pred_norm = prediction - prediction.mean(dim=0)
+        cov_pred = (pred_norm.T @ pred_norm) / (prediction.size(0) - 1)
+        cov_loss = off_diagonal(cov_pred).pow_(2).sum() / prediction.size(1)
+
+        # --- LOSS 3: Spherical Variance (SAFETY NET) ---
+        # Lowered threshold to 0.010 to allow model to match RoBERTa's natural tightness
+        # Only kicks in if vectors become dangerously identical
+        var_threshold = 0.010
+        
+        std_pred = torch.sqrt(prediction.var(dim=0) + 1e-4)
+        std_loss = torch.mean(F.relu(var_threshold - std_pred))
+
+        # Total Loss
+        # DRASTIC WEIGHT REDUCTION
+        # Pred: 1.0 (King)
+        # Cov: 5.0 (Advisor) - Was 200.0
+        # Std: 5.0 (Guard) - Was 25.0
+        loss = loss_pred + (5.0 * cov_loss) + (5.0 * std_loss)
+        
+        return loss, prediction, target_embeddings, loss_pred, cov_loss, std_loss
+    
+    @torch.no_grad()
+    def update_target_ema(self):
+        for param, ema_param in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
+            ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
+
+# --- EXECUTION ---
+def main():
+    print(f"Using device: {Config.device}")
+    
+    # 1. LOGGING & DRIVE
+    wandb.login()
+    wandb.init(project="para-jepa-spherical-soft", config=Config.__dict__)
+    
+    print("Mounting Google Drive...")
+    drive.mount('/content/drive')
+    drive_save_path = "/content/drive/MyDrive/ParaJEPA_Checkpoints"
+    os.makedirs(drive_save_path, exist_ok=True)
+    print(f"Checkpoints will be saved to: {drive_save_path}")
+
+    # Initialize components
+    tokenizer = AutoTokenizer.from_pretrained(Config.model_name)
+    model = ParaJEPA(Config.model_name, Config.hidden_dim, pred_depth=Config.pred_depth, pred_hidden_dim=Config.pred_hidden_dim).to(Config.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.learning_rate, weight_decay=Config.weight_decay)
+    
+    # Load Data (Fast Run: 5000 Samples)
+    print("Loading Data...")
+    train_set = WikiAutoAssetDataset(tokenizer, split='train', max_samples=5000) 
+    valid_set = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=500)
+    
+    train_loader = DataLoader(train_set, batch_size=Config.batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_set, batch_size=Config.batch_size, shuffle=False)
+    
+    # Train Loop
+    print("Starting Training...")
+    best_loss = float('inf')
+    
+    for epoch in range(Config.epochs):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        
+        for batch in pbar:
+            s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+            c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+            
+            # Unpack all 6 return values
+            loss, _, _, loss_pred, cov_loss, std_loss = model(s_in, c_in)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            model.update_target_ema()
+            
+            # --- LOGGING ---
+            wandb.log({
+                "train_loss": loss.item(), 
+                "pred_loss": loss_pred.item(),
+                "cov_loss": cov_loss.item(), 
+                "std_loss": std_loss.item(),
+                "epoch": epoch
+            })
+            pbar.set_postfix({'loss': loss.item(), 'std': std_loss.item()})
+            
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in valid_loader:
+                s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+                c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+                loss, _, _, _, _, _ = model(s_in, c_in)
+                val_loss += loss.item()
+        
+        avg_val = val_loss / len(valid_loader)
+        print(f"Epoch {epoch+1} Val Loss: {avg_val:.4f}")
+        wandb.log({"val_loss": avg_val})
+        
+        if avg_val < best_loss:
+            best_loss = avg_val
+            drive_file = f"{drive_save_path}/para_jepa_best_model.pt"
+            torch.save(model.state_dict(), drive_file)
+            print(f"Checkpoint Saved: {drive_file}")
+
+    print("Training Complete.")
+    wandb.finish()
+
+if __name__ == "__main__":
+    main()
+
+Results:Loading Data...
+Loading train dataset...
+Loading validation dataset...
+Starting Training...
+Epoch 1: 100%|██████████| 313/313 [02:35<00:00, 2.02it/s, loss=0.0185, std=0]
+
+Epoch 1 Val Loss: 0.0173
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Epoch 2: 100%|██████████| 313/313 [02:33<00:00, 2.03it/s, loss=0.00162, std=0]
+
+Epoch 2 Val Loss: 0.0005
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Epoch 3: 100%|██████████| 313/313 [02:33<00:00, 2.03it/s, loss=0.00102, std=0]
+
+Epoch 3 Val Loss: 0.0001
+Checkpoint Saved: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt
+Epoch 4: 27%|██▋ | 86/313 [00:43<01:55, 1.97it/s, loss=0.000657, std=0]
+
+---------------------------------------------------------------------------
+KeyboardInterrupt Traceback (most recent call last)
+
+========================================
+🔎 RUNNING IDENTITY COLLAPSE FORENSICS
+========================================
+📊 BATCH STATISTICS (N=32):
+1. Natural Similarity (Source <-> Target) : 0.99920 (The Baseline)
+2. Model Performance (Pred <-> Target) : 0.99985 (The Goal)
+3. Identity Check (Pred <-> Source) : 0.99896 (The Trap)
+4. Output Diversity (Batch Std Dev) : 0.00011
+
+🧐 DIAGNOSIS:
+🚨 POINT COLLAPSE DETECTED: The model outputs the exact same vector for every input.
+
+Outcome:The Verdict: Why Spherical Failed
+The log std=0 and Output Diversity: 0.00011 is the final proof.
+* The Geometry Problem: RoBERTa's natural embeddings are a "needle" (extremely thin cone).
+* The Spherical Failure: We tried to gently widen that needle with a tiny threshold (0.01). The model found it easier to just collapse to a single point (Diversity 0.0001) than to maintain that delicate balance.
+
+Trial 5: VICReg + Mean Pooling
+
+# 1. Install Dependencies
+!pip install -q transformers datasets wandb textstat scikit-learn
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel, AutoTokenizer
+from datasets import load_dataset
+from google.colab import drive
+import copy
+from tqdm import tqdm
+import json
+import wandb
+import random
+import numpy as np
+import os
+
+# --- CONFIGURATION ---
+class Config:
+    model_name = 'roberta-base'
+    hidden_dim = 768
+    pred_depth = 3
+    pred_hidden_dim = 196
+    
+    # Training
+    batch_size = 16
+    learning_rate = 2e-5
+    epochs = 5
+    weight_decay = 0.01
+    max_length = 128
+    seed = 42
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# --- DATASET ---
+class WikiAutoAssetDataset(Dataset):
+    def __init__(self, tokenizer, split="train", max_length=128, max_samples=None):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.split = split
+        
+        print(f"Loading {split} dataset...")
+        try:
+            self.dataset = load_dataset("GEM/wiki_auto_asset_turk", split=split)
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            self.dataset = []
+
+        if max_samples:
+            self.dataset = self.dataset.select(range(min(len(self.dataset), max_samples)))
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        complex_text = item['source']
+        
+        if self.split == 'train':
+            if 'target' in item: simple_text = item['target']
+            elif 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            else: simple_text = complex_text 
+        else:
+            if 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            elif 'target' in item: simple_text = item['target']
+            else: simple_text = complex_text
+        
+        style_enc = self.tokenizer(complex_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+        content_enc = self.tokenizer(simple_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+
+        return {
+            'style_input_ids': style_enc['input_ids'].squeeze(0),
+            'style_attention_mask': style_enc['attention_mask'].squeeze(0),
+            'content_input_ids': content_enc['input_ids'].squeeze(0),
+            'content_attention_mask': content_enc['attention_mask'].squeeze(0),
+        }
+
+# --- MODELS (VICReg + Mean Pooling) ---
+class JEPAEncoder(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(model_name)
+        # VICReg Projection: Often deeper, but we keep it simple for now
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim) 
+        )
+    
+    def forward(self, input_ids, attention_mask):
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        token_embeddings = outputs.last_hidden_state
+
+        # Mean Pooling (Masked)
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mean_pooled = sum_embeddings / sum_mask
+
+        # NO NORMALIZATION: We want the model to learn magnitude!
+        embeddings = self.projection(mean_pooled)
+        return embeddings
+
+class JEPAPredictor(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=256, output_dim=768, depth=3):
+        super().__init__()
+        layers = [nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()]
+        for _ in range(depth-2):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()])
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.layers = nn.Sequential(*layers)
+    
+    def forward(self, x): return self.layers(x)
+
+class ParaJEPA(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3, pred_hidden_dim=196):
+        super().__init__()
+        self.ema_decay = ema_decay
+        self.context_encoder = JEPAEncoder(model_name, hidden_dim)
+        self.target_encoder = copy.deepcopy(self.context_encoder)
+        for p in self.target_encoder.parameters(): p.requires_grad = False
+        self.predictor = JEPAPredictor(input_dim=hidden_dim, hidden_dim=pred_hidden_dim, output_dim=hidden_dim, depth=pred_depth)
+    
+    def forward(self, style_input, content_input):
+        # 1. Encode
+        context_embeddings = self.context_encoder(style_input['input_ids'], style_input['attention_mask'])
+        with torch.no_grad():
+            target_embeddings = self.target_encoder(content_input['input_ids'], content_input['attention_mask'])
+        
+        # 2. Predict (NO NORMALIZATION)
+        prediction = self.predictor(context_embeddings)
+        
+        # --- LOSS 1: MSE (Euclidean Distance) ---
+        loss_pred = F.mse_loss(prediction, target_embeddings)
+        
+        # --- LOSS 2: Variance (The Anti-Collapse) ---
+        # VICReg Standard: Force std to be close to 1.0
+        # If std < 1.0, this loss explodes, forcing the embeddings to expand.
+        std_pred = torch.sqrt(prediction.var(dim=0) + 0.0001)
+        std_target = torch.sqrt(target_embeddings.var(dim=0) + 0.0001)
+        
+        # Hinge Loss: We want std >= 1.0
+        std_loss = torch.mean(F.relu(1.0 - std_pred)) + torch.mean(F.relu(1.0 - std_target))
+
+        # --- LOSS 3: Covariance (Decorrelation) ---
+        def off_diagonal(x):
+            n, m = x.shape
+            return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+        
+        pred_norm = prediction - prediction.mean(dim=0)
+        cov_pred = (pred_norm.T @ pred_norm) / (prediction.size(0) - 1)
+        cov_loss = off_diagonal(cov_pred).pow_(2).sum() / prediction.size(1)
+
+        # Total Loss
+        # Standard VICReg weights: 25.0 for Var/MSE, 1.0 for Cov
+        loss = (25.0 * loss_pred) + (25.0 * std_loss) + (1.0 * cov_loss)
+        
+        return loss, prediction, target_embeddings, loss_pred, cov_loss, std_loss
+    
+    @torch.no_grad()
+    def update_target_ema(self):
+        for param, ema_param in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
+            ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
+
+# --- EXECUTION ---
+def main():
+    print(f"Using device: {Config.device}")
+    
+    wandb.login()
+    wandb.init(project="para-jepa-vicreg", config=Config.__dict__)
+    
+    print("Mounting Google Drive...")
+    drive.mount('/content/drive')
+    drive_save_path = "/content/drive/MyDrive/ParaJEPA_Checkpoints"
+    os.makedirs(drive_save_path, exist_ok=True)
+
+    # Initialize components
+    tokenizer = AutoTokenizer.from_pretrained(Config.model_name)
+    model = ParaJEPA(Config.model_name, Config.hidden_dim, pred_depth=Config.pred_depth, pred_hidden_dim=Config.pred_hidden_dim).to(Config.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.learning_rate, weight_decay=Config.weight_decay)
+    
+    # Load Data
+    train_set = WikiAutoAssetDataset(tokenizer, split='train', max_samples=5000) 
+    valid_set = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=500)
+    
+    train_loader = DataLoader(train_set, batch_size=Config.batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_set, batch_size=Config.batch_size, shuffle=False)
+    
+    # Train Loop
+    best_loss = float('inf')
+    
+    for epoch in range(Config.epochs):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        
+        for batch in pbar:
+            s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+            c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+            
+            loss, _, _, loss_pred, cov_loss, std_loss = model(s_in, c_in)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            model.update_target_ema()
+            
+            wandb.log({
+                "train_loss": loss.item(), 
+                "pred_loss": loss_pred.item(),
+                "cov_loss": cov_loss.item(), 
+                "std_loss": std_loss.item(),
+                "epoch": epoch
+            })
+            # Watch 'std' - it should start HIGH and go down, but never hit 0
+            pbar.set_postfix({'loss': loss.item(), 'std': std_loss.item()})
+            
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in valid_loader:
+                s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+                c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+                loss, _, _, _, _, _ = model(s_in, c_in)
+                val_loss += loss.item()
+        
+        avg_val = val_loss / len(valid_loader)
+        print(f"Epoch {epoch+1} Val Loss: {avg_val:.4f}")
+        wandb.log({"val_loss": avg_val})
+        
+        if avg_val < best_loss:
+            best_loss = avg_val
+            torch.save(model.state_dict(), f"{drive_save_path}/para_jepa_vicreg_best.pt")
+            print(f"Checkpoint Saved")
+
+    print("Training Complete.")
+    wandb.finish()
+
+if __name__ == "__main__":
+    main()
+
+Evaluation Code:import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer
+from torch.utils.data import DataLoader
+
+# --- 1. SETUP & RELOAD ---
+print("🔄 Setting up Diagnostic Environment...")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+tokenizer = AutoTokenizer.from_pretrained('roberta-base')
+
+# The ParaJEPA class is already defined in memory from the previous cell (VICReg version)
+model = ParaJEPA(
+    model_name='roberta-base', 
+    hidden_dim=768, 
+    pred_depth=Config.pred_depth, 
+    pred_hidden_dim=Config.pred_hidden_dim
+).to(device)
+
+# Load the saved checkpoint from Drive
+drive_path = "/content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_vicreg_best.pt" 
+# NOTE: I updated the filename to match the VICReg save name 'para_jepa_vicreg_best.pt'
+# If you saved it as 'para_jepa_best_model.pt', change it back.
+
+try:
+    print(f"📂 Loading checkpoint from: {drive_path}")
+    state_dict = torch.load(drive_path, map_location=device)
+    model.load_state_dict(state_dict)
+    print("✅ Model loaded successfully.")
+except FileNotFoundError:
+    print("❌ Checkpoint not found! Checking alternative names...")
+    try:
+        # Fallback to the generic name if the specific one isn't found
+        drive_path = "/content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_best_model.pt"
+        state_dict = torch.load(drive_path, map_location=device)
+        model.load_state_dict(state_dict)
+        print(f"✅ Loaded from fallback: {drive_path}")
+    except:
+        print("❌ No checkpoint found. Using untrained model.")
+except Exception as e:
+    print(f"⚠️ Error loading model: {e}")
+
+model.eval()
+
+# Load a tiny validation batch
+print("📚 Loading validation sample...")
+val_dataset = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=100)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+# --- 2. THE DIAGNOSTIC FUNCTION ---
+def diagnose_collapse(model, dataloader, device):
+    print("\n" + "="*40)
+    print("🔎 RUNNING VICReg FORENSICS")
+    print("="*40)
+    
+    batch = next(iter(dataloader))
+    
+    style_inputs = {
+        'input_ids': batch['style_input_ids'].to(device),
+        'attention_mask': batch['style_attention_mask'].to(device),
+    }
+    content_inputs = {
+        'input_ids': batch['content_input_ids'].to(device),
+        'attention_mask': batch['content_attention_mask'].to(device),
+    }
+
+    with torch.no_grad():
+        # A. Encode
+        input_emb = model.context_encoder(style_inputs['input_ids'], style_inputs['attention_mask'])
+        target_emb = model.target_encoder(content_inputs['input_ids'], content_inputs['attention_mask'])
+        
+        # B. Predict (Raw VICReg Output)
+        raw_pred = model.predictor(input_emb)
+        
+        # C. Create Normalized Versions (Just for Angle Comparison)
+        pred_norm = F.normalize(raw_pred, p=2, dim=1)
+        input_norm = F.normalize(input_emb, p=2, dim=1)
+        target_norm = F.normalize(target_emb, p=2, dim=1)
+        
+        # --- METRICS ---
+        
+        # 1. Cosine Similarity (Angles)
+        baseline_sim = F.cosine_similarity(input_norm, target_norm, dim=-1).mean().item()
+        pred_target_sim = F.cosine_similarity(pred_norm, target_norm, dim=-1).mean().item()
+        pred_input_sim = F.cosine_similarity(pred_norm, input_norm, dim=-1).mean().item()
+        
+        # 2. VICReg Specifics (Magnitude & Variance)
+        # Check if the model learned to explode the variance to 1.0
+        raw_std = torch.sqrt(raw_pred.var(dim=0) + 1e-4).mean().item()
+        avg_magnitude = raw_pred.norm(dim=1).mean().item()
+
+        # --- REPORTING ---
+        print(f"📊 BATCH STATISTICS:")
+        print(f"  --- Angles (Cosine) ---")
+        print(f"  1. Natural Similarity : {baseline_sim:.5f}")
+        print(f"  2. Model Performance  : {pred_target_sim:.5f}")
+        print(f"  3. Identity Check     : {pred_input_sim:.5f}")
+        print(f"\n  --- VICReg Structure (Crucial) ---")
+        print(f"  4. Raw Std Deviation  : {raw_std:.5f}  (Goal: ~1.0)")
+        print(f"  5. Avg Vector Length  : {avg_magnitude:.5f}")
+        
+        print("\n🧐 DIAGNOSIS:")
+        
+        if raw_std < 0.1:
+            print("🚨 COLLAPSE: The Variance is too low. VICReg failed to expand the embeddings.")
+        elif raw_std > 0.5:
+            print("✅ EXPANSION DETECTED: The model is successfully expanding variance.")
+            if pred_target_sim > baseline_sim:
+                print("🚀 LEARNING CONFIRMED: High Variance AND Improved Similarity.")
+            else:
+                print("⚠️ PARTIAL SUCCESS: Variance is good, but similarity hasn't beat baseline yet.")
+        else:
+             print("⚠️ LOW VARIANCE: Model is struggling to reach std=1.0.")
+
+    return input_emb, target_emb, raw_pred
+
+# --- 3. EXECUTE ---
+input_e, target_e, pred_e = diagnose_collapse(model, val_loader, device)
+Results:Mounting Google Drive...
+Drive already mounted at /content/drive; to attempt to forcibly remount, call drive.mount("/content/drive", force_remount=True).
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+Loading train dataset...
+Loading validation dataset...
+Epoch 1: 100%|██████████| 313/313 [02:36<00:00, 2.01it/s, loss=41.9, std=1.47]
+
+Epoch 1 Val Loss: 47.0650
+Checkpoint Saved
+Epoch 2: 100%|██████████| 313/313 [02:36<00:00, 2.00it/s, loss=40.1, std=1.4]
+
+Epoch 2 Val Loss: 46.3414
+Checkpoint Saved
+Epoch 3: 100%|██████████| 313/313 [02:34<00:00, 2.02it/s, loss=39.4, std=1.36]
+
+Epoch 3 Val Loss: 46.0560
+Checkpoint Saved
+Epoch 4: 100%|██████████| 313/313 [02:34<00:00, 2.02it/s, loss=38.8, std=1.35]
+
+Epoch 4 Val Loss: 45.6042
+Checkpoint Saved
+Epoch 5: 100%|██████████| 313/313 [02:34<00:00, 2.02it/s, loss=38.8, std=1.35]
+
+Epoch 5 Val Loss: 45.2919
+Checkpoint Saved
+Training Complete.
+
+🔄 Setting up Diagnostic Environment...
+
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+📂 Loading checkpoint from: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_vicreg_best.pt
+✅ Model loaded successfully.
+📚 Loading validation sample...
+Loading validation dataset...
+
+========================================
+🔎 RUNNING VICReg FORENSICS
+========================================
+📊 BATCH STATISTICS:
+--- Angles (Cosine) ---
+1. Natural Similarity : 0.91537
+2. Model Performance : 0.71999
+3. Identity Check : 0.73755
+
+--- VICReg Structure (Crucial) ---
+4. Raw Std Deviation : 0.28425 (Goal: ~1.0)
+5. Avg Vector Length : 12.46951
+
+🧐 DIAGNOSIS:
+⚠️ LOW VARIANCE: Model is struggling to reach std=1.0.
+Outcome: This result reveals exactly why the standard VICReg failed: The "Magnitude Conflict."
+The Diagnosis
+1. The Conflict:
+    * Variance Loss is screaming: "Grow to size 1.0!"
+    * MSE Loss is screaming: "Match the Target!"
+    * The Problem: The Target (RoBERTa) is tiny (std ≈ 0.02).
+    * The Result: The model tried to grow (reached 0.28), but growing further made the MSE loss explosion (distance to target) greater than the Variance reward. It got stuck in the middle (0.28), satisfying neither.
+2. The Consequence:
+    * Because the model was fighting this magnitude war, it stopped focusing on the direction (Semantic Similarity). That's why your performance (0.720) is terrible compared to the baseline (0.915).
+Trial 6: Cosine-VICReg
+
+!pip install -q transformers datasets wandb textstat scikit-learn
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel, AutoTokenizer
+from datasets import load_dataset
+from google.colab import drive
+import copy
+from tqdm import tqdm
+import json
+import wandb
+import random
+import numpy as np
+import os
+
+# --- CONFIGURATION ---
+class Config:
+    model_name = 'roberta-base'
+    hidden_dim = 768
+    pred_depth = 3
+    pred_hidden_dim = 196
+    
+    # Training
+    batch_size = 16
+    learning_rate = 2e-5
+    epochs = 5
+    weight_decay = 0.01
+    max_length = 128
+    seed = 42
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# --- DATASET ---
+class WikiAutoAssetDataset(Dataset):
+    def __init__(self, tokenizer, split="train", max_length=128, max_samples=None):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.split = split
+        
+        print(f"Loading {split} dataset...")
+        try:
+            self.dataset = load_dataset("GEM/wiki_auto_asset_turk", split=split)
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            self.dataset = []
+
+        if max_samples:
+            self.dataset = self.dataset.select(range(min(len(self.dataset), max_samples)))
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        complex_text = item['source']
+        
+        if self.split == 'train':
+            if 'target' in item: simple_text = item['target']
+            elif 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            else: simple_text = complex_text 
+        else:
+            if 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            elif 'target' in item: simple_text = item['target']
+            else: simple_text = complex_text
+        
+        style_enc = self.tokenizer(complex_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+        content_enc = self.tokenizer(simple_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+
+        return {
+            'style_input_ids': style_enc['input_ids'].squeeze(0),
+            'style_attention_mask': style_enc['attention_mask'].squeeze(0),
+            'content_input_ids': content_enc['input_ids'].squeeze(0),
+            'content_attention_mask': content_enc['attention_mask'].squeeze(0),
+        }
+
+# --- MODELS (Hybrid VICReg v2) ---
+class JEPAEncoder(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(model_name)
+        # VICReg Projection
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim) 
+        )
+    
+    def forward(self, input_ids, attention_mask):
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        token_embeddings = outputs.last_hidden_state
+
+        # Mean Pooling
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mean_pooled = sum_embeddings / sum_mask
+
+        # Project (Unbounded)
+        embeddings = self.projection(mean_pooled)
+        return embeddings
+
+class JEPAPredictor(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=256, output_dim=768, depth=3):
+        super().__init__()
+        layers = [nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()]
+        for _ in range(depth-2):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()])
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.layers = nn.Sequential(*layers)
+    
+    def forward(self, x): return self.layers(x)
+
+class ParaJEPA(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3, pred_hidden_dim=196):
+        super().__init__()
+        self.ema_decay = ema_decay
+        self.context_encoder = JEPAEncoder(model_name, hidden_dim)
+        self.target_encoder = copy.deepcopy(self.context_encoder)
+        for p in self.target_encoder.parameters(): p.requires_grad = False
+        self.predictor = JEPAPredictor(input_dim=hidden_dim, hidden_dim=pred_hidden_dim, output_dim=hidden_dim, depth=pred_depth)
+    
+    def forward(self, style_input, content_input):
+        # 1. Encode
+        context_embeddings = self.context_encoder(style_input['input_ids'], style_input['attention_mask'])
+        with torch.no_grad():
+            target_embeddings = self.target_encoder(content_input['input_ids'], content_input['attention_mask'])
+        
+        # 2. Predict
+        prediction = self.predictor(context_embeddings)
+        
+        # --- LOSS 1: Cosine Distance (HYBRID FIX) ---
+        # Scale-Invariant alignment
+        cos_sim = F.cosine_similarity(prediction, target_embeddings, dim=-1).mean()
+        loss_pred = 1.0 - cos_sim
+        
+        # --- LOSS 2: Variance (EXPANSION) ---
+        # We enforce expansion on context_embeddings.
+        # This solves RoBERTa's natural collapse (std ~0.02 -> 1.0).
+        std_context = torch.sqrt(context_embeddings.var(dim=0) + 0.0001)
+        std_pred = torch.sqrt(prediction.var(dim=0) + 0.0001)
+        
+        std_loss = torch.mean(F.relu(1.0 - std_context)) + torch.mean(F.relu(1.0 - std_pred))
+
+        # --- LOSS 3: Covariance (DECORRELATION) ---
+        def off_diagonal(x):
+            n, m = x.shape
+            return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+        
+        # FIX: Apply Covariance to Context (Backbone) AND Prediction
+        # This ensures the encoder actually learns distinct features
+        ctx_norm = context_embeddings - context_embeddings.mean(dim=0)
+        cov_ctx = (ctx_norm.T @ ctx_norm) / (context_embeddings.size(0) - 1)
+        cov_loss_ctx = off_diagonal(cov_ctx).pow_(2).sum() / context_embeddings.size(1)
+
+        # Total Loss
+        # Weights: 
+        # Pred: 1.0 (Alignment)
+        # Var: 25.0 (Strong Expansion Force)
+        # Cov: 1.0 (Standard Decorrelation)
+        loss = loss_pred + (25.0 * std_loss) + (1.0 * cov_loss_ctx)
+        
+        return loss, prediction, target_embeddings, loss_pred, cov_loss_ctx, std_loss
+    
+    @torch.no_grad()
+    def update_target_ema(self):
+        for param, ema_param in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
+            ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
+
+# --- EXECUTION ---
+def main():
+    print(f"Using device: {Config.device}")
+    
+    wandb.login()
+    # FIX: Clean config dict
+    config_dict = {k: v for k, v in Config.__dict__.items() if not k.startswith('__')}
+    wandb.init(project="para-jepa-hybrid-v2", config=config_dict)
+    
+    print("Mounting Google Drive...")
+    drive.mount('/content/drive')
+    drive_save_path = "/content/drive/MyDrive/ParaJEPA_Checkpoints"
+    os.makedirs(drive_save_path, exist_ok=True)
+
+    # Initialize components
+    tokenizer = AutoTokenizer.from_pretrained(Config.model_name)
+    model = ParaJEPA(Config.model_name, Config.hidden_dim, pred_depth=Config.pred_depth, pred_hidden_dim=Config.pred_hidden_dim).to(Config.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.learning_rate, weight_decay=Config.weight_decay)
+    
+    # Load Data
+    train_set = WikiAutoAssetDataset(tokenizer, split='train', max_samples=5000) 
+    valid_set = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=500)
+    
+    train_loader = DataLoader(train_set, batch_size=Config.batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_set, batch_size=Config.batch_size, shuffle=False)
+    
+    # Train Loop
+    best_loss = float('inf')
+    
+    for epoch in range(Config.epochs):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        
+        for batch in pbar:
+            s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+            c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+            
+            loss, _, _, loss_pred, cov_loss, std_loss = model(s_in, c_in)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            model.update_target_ema()
+            
+            wandb.log({
+                "train_loss": loss.item(), 
+                "pred_loss": loss_pred.item(),
+                "cov_loss": cov_loss.item(), 
+                "std_loss": std_loss.item(),
+                "epoch": epoch
+            })
+            pbar.set_postfix({'loss': loss.item(), 'std': std_loss.item()})
+            
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in valid_loader:
+                s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+                c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+                loss, _, _, _, _, _ = model(s_in, c_in)
+                val_loss += loss.item()
+        
+        avg_val = val_loss / len(valid_loader)
+        print(f"Epoch {epoch+1} Val Loss: {avg_val:.4f}")
+        wandb.log({"val_loss": avg_val})
+        
+        if avg_val < best_loss:
+            best_loss = avg_val
+            torch.save(model.state_dict(), f"{drive_save_path}/para_jepa_hybrid_best.pt")
+            print(f"Checkpoint Saved")
+
+    print("Training Complete.")
+    wandb.finish()
+
+if __name__ == "__main__":
+    main()
+
+Results:
+
+Evaluation Code:
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer
+from torch.utils.data import DataLoader
+
+# --- 1. SETUP & RELOAD ---
+print("🔄 Setting up Diagnostic Environment...")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+tokenizer = AutoTokenizer.from_pretrained('roberta-base')
+
+# The ParaJEPA class is already defined in memory from your training cell
+model = ParaJEPA(
+    model_name='roberta-base', 
+    hidden_dim=768, 
+    pred_depth=Config.pred_depth, 
+    pred_hidden_dim=Config.pred_hidden_dim
+).to(device)
+
+# --- FIX: Load the 'Hybrid' Checkpoint ---
+drive_path = "/content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_hybrid_best.pt" 
+
+try:
+    print(f"📂 Loading checkpoint from: {drive_path}")
+    state_dict = torch.load(drive_path, map_location=device)
+    model.load_state_dict(state_dict)
+    print("✅ Model loaded successfully.")
+except FileNotFoundError:
+    print(f"❌ Checkpoint not found at {drive_path}")
+    print("⚠️ Using untrained model (Expect random results).")
+except Exception as e:
+    print(f"⚠️ Error loading model: {e}")
+
+model.eval()
+
+# Load a tiny validation batch
+print("📚 Loading validation sample...")
+val_dataset = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=100)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+
+# --- 2. THE DIAGNOSTIC FUNCTION ---
+def diagnose_collapse(model, dataloader, device):
+    print("\n" + "="*40)
+    print("🔎 RUNNING HYBRID FORENSICS")
+    print("="*40)
+    
+    batch = next(iter(dataloader))
+    
+    style_inputs = {
+        'input_ids': batch['style_input_ids'].to(device),
+        'attention_mask': batch['style_attention_mask'].to(device),
+    }
+    content_inputs = {
+        'input_ids': batch['content_input_ids'].to(device),
+        'attention_mask': batch['content_attention_mask'].to(device),
+    }
+
+    with torch.no_grad():
+        # A. Encode
+        # Note: These are raw, unbounded embeddings now
+        input_emb = model.context_encoder(style_inputs['input_ids'], style_inputs['attention_mask'])
+        target_emb = model.target_encoder(content_inputs['input_ids'], content_inputs['attention_mask'])
+        
+        # B. Predict
+        raw_pred = model.predictor(input_emb)
+        
+        # C. Normalize for Angle Checks
+        pred_norm = F.normalize(raw_pred, p=2, dim=1)
+        input_norm = F.normalize(input_emb, p=2, dim=1)
+        target_norm = F.normalize(target_emb, p=2, dim=1)
+        
+        # --- METRICS ---
+        
+        # 1. Angles (Cosine)
+        baseline_sim = F.cosine_similarity(input_norm, target_norm, dim=-1).mean().item()
+        pred_target_sim = F.cosine_similarity(pred_norm, target_norm, dim=-1).mean().item()
+        pred_input_sim = F.cosine_similarity(pred_norm, input_norm, dim=-1).mean().item()
+        
+        # 2. Magnitudes (VICReg Success Check)
+        # We check Context specifically because that's where we applied the fix!
+        context_std = torch.sqrt(input_emb.var(dim=0) + 1e-4).mean().item()
+        pred_std = torch.sqrt(raw_pred.var(dim=0) + 1e-4).mean().item()
+
+        # --- REPORTING ---
+        print(f"📊 BATCH STATISTICS:")
+        print(f"  --- Angles (Cosine) ---")
+        print(f"  1. Natural Similarity : {baseline_sim:.5f}")
+        print(f"  2. Model Performance  : {pred_target_sim:.5f} (Higher is better)")
+        print(f"  3. Identity Check     : {pred_input_sim:.5f}")
+        
+        print(f"\n  --- Expansion Check (Target: ~1.0) ---")
+        print(f"  4. Context Std Dev    : {context_std:.5f}  <-- DID THE DEAD GRADIENT FIX WORK?")
+        print(f"  5. Predictor Std Dev  : {pred_std:.5f}")
+        
+        print("\n🧐 DIAGNOSIS:")
+        
+        # Check Expansion
+        if context_std < 0.1:
+            print("🚨 EXPANSION FAILED: Context Variance is still tiny. Weights didn't update?")
+        elif context_std > 0.5:
+            print("✅ EXPANSION SUCCESS: Context Encoder is exploding the variance as requested!")
+        
+        # Check Learning
+        if pred_target_sim > baseline_sim:
+            print("🚀 LEARNING CONFIRMED: The model beat the natural baseline!")
+            gain = pred_target_sim - baseline_sim
+            print(f"   Gain: +{gain:.5f}")
+        else:
+             print("⚠️ STRUGGLING: Model has expanded, but hasn't beaten the baseline yet.")
+
+    return input_emb, target_emb, raw_pred
+
+# --- 3. EXECUTE ---
+input_e, target_e, pred_e = diagnose_collapse(model, val_loader, device)
+
+Outcome:
+
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+Loading train dataset...
+Loading validation dataset...
+Epoch 1: 100%|██████████| 313/313 [02:33<00:00, 2.04it/s, loss=26.3, std=0.84]
+
+Epoch 1 Val Loss: 38.0644
+Checkpoint Saved
+Epoch 2: 100%|██████████| 313/313 [02:34<00:00, 2.03it/s, loss=22.2, std=0.701]
+
+Epoch 2 Val Loss: 35.1444
+Checkpoint Saved
+Epoch 3: 100%|██████████| 313/313 [02:34<00:00, 2.02it/s, loss=20.6, std=0.638]
+
+Epoch 3 Val Loss: 33.8759
+Checkpoint Saved
+Epoch 4: 100%|██████████| 313/313 [02:34<00:00, 2.02it/s, loss=19.7, std=0.571]
+
+Epoch 4 Val Loss: 33.7094
+Checkpoint Saved
+Epoch 5: 100%|██████████| 313/313 [02:34<00:00, 2.03it/s, loss=19.7, std=0.568]
+
+Epoch 5 Val Loss: 34.2437
+Training Complete.
+
+🔄 Setting up Diagnostic Environment...
+
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+📂 Loading checkpoint from: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_hybrid_best.pt
+✅ Model loaded successfully.
+📚 Loading validation sample...
+Loading validation dataset...
+
+========================================
+🔎 RUNNING HYBRID FORENSICS
+========================================
+📊 BATCH STATISTICS:
+--- Angles (Cosine) ---
+1. Natural Similarity : 0.84718
+2. Model Performance : 0.02228 (Higher is better)
+3. Identity Check : 0.03011
+
+--- Expansion Check (Target: ~1.0) ---
+4. Context Std Dev : 0.34965 <-- DID THE DEAD GRADIENT FIX WORK?
+5. Predictor Std Dev : 1.23971
+
+🧐 DIAGNOSIS:
+⚠️ STRUGGLING: Model has expanded, but hasn't beaten the baseline yet.
+
+
+Outcome:This result is extremely revealing. It confirms that the "Dead Gradient" fix worked, but it also reveals a new problem: "The Rogue Predictor."
+1. The Success: The "Dead Gradient" is Fixe!
+* Context Std Dev: 0.35 (started at ~0.02).
+* Meaning: The backbone (RoBERTa) is finally expanding! It grew from 0.02 to 0.35. This proves that moving the variance loss to the Context Encoder successfully forced gradients into the transformer. The backbone is learning a new, non-collapsed geometry.
+2. The Failure: The Predictor Exploded
+* Predictor Std Dev: 1.24 (Target was 1.0).
+* Model Performance: 0.02 (Random noise).
+* What happened: The Predictor (a simple MLP) is much faster to learn than the Encoder (a massive Transformer). When we told both of them "Make variance 1.0", the MLP said "Easy!" and instantly exploded its weights to blast the variance up to 1.24.
+* The Cost: In its rush to explode, the MLP completely scrambled the signal. It turned the organized embeddings from the encoder into random high-variance noise (hence the 0.02 similarity).
+
+
+Trial 7: Remove the Variance Loss from the Predictor
+
+# 1. Install Dependencies
+!pip install -q transformers datasets wandb textstat scikit-learn
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel, AutoTokenizer
+from datasets import load_dataset
+from google.colab import drive
+import copy
+from tqdm import tqdm
+import json
+import wandb
+import random
+import numpy as np
+import os
+
+# --- CONFIGURATION ---
+class Config:
+    model_name = 'roberta-base'
+    hidden_dim = 768
+    pred_depth = 3
+    pred_hidden_dim = 196
+    
+    # Training
+    batch_size = 16
+    learning_rate = 2e-5
+    epochs = 5
+    weight_decay = 0.01
+    max_length = 128
+    seed = 42
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# --- DATASET ---
+class WikiAutoAssetDataset(Dataset):
+    def __init__(self, tokenizer, split="train", max_length=128, max_samples=None):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.split = split
+        
+        print(f"Loading {split} dataset...")
+        try:
+            self.dataset = load_dataset("GEM/wiki_auto_asset_turk", split=split)
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            self.dataset = []
+
+        if max_samples:
+            self.dataset = self.dataset.select(range(min(len(self.dataset), max_samples)))
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        complex_text = item['source']
+        
+        if self.split == 'train':
+            if 'target' in item: simple_text = item['target']
+            elif 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            else: simple_text = complex_text 
+        else:
+            if 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            elif 'target' in item: simple_text = item['target']
+            else: simple_text = complex_text
+        
+        style_enc = self.tokenizer(complex_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+        content_enc = self.tokenizer(simple_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+
+        return {
+            'style_input_ids': style_enc['input_ids'].squeeze(0),
+            'style_attention_mask': style_enc['attention_mask'].squeeze(0),
+            'content_input_ids': content_enc['input_ids'].squeeze(0),
+            'content_attention_mask': content_enc['attention_mask'].squeeze(0),
+        }
+
+# --- MODELS (Hybrid v3: Encoder-Focused) ---
+class JEPAEncoder(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(model_name)
+        # VICReg Projection
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim) 
+        )
+    
+    def forward(self, input_ids, attention_mask):
+        outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+        token_embeddings = outputs.last_hidden_state
+
+        # Mean Pooling
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+        sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+        mean_pooled = sum_embeddings / sum_mask
+
+        # Project (Unbounded)
+        embeddings = self.projection(mean_pooled)
+        return embeddings
+
+class JEPAPredictor(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=256, output_dim=768, depth=3):
+        super().__init__()
+        layers = [nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()]
+        for _ in range(depth-2):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()])
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.layers = nn.Sequential(*layers)
+    
+    def forward(self, x): return self.layers(x)
+
+class ParaJEPA(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3, pred_hidden_dim=196):
+        super().__init__()
+        self.ema_decay = ema_decay
+        self.context_encoder = JEPAEncoder(model_name, hidden_dim)
+        self.target_encoder = copy.deepcopy(self.context_encoder)
+        for p in self.target_encoder.parameters(): p.requires_grad = False
+        self.predictor = JEPAPredictor(input_dim=hidden_dim, hidden_dim=pred_hidden_dim, output_dim=hidden_dim, depth=pred_depth)
+    
+    def forward(self, style_input, content_input):
+        # 1. Encode
+        context_embeddings = self.context_encoder(style_input['input_ids'], style_input['attention_mask'])
+        with torch.no_grad():
+            target_embeddings = self.target_encoder(content_input['input_ids'], content_input['attention_mask'])
+        
+        # 2. Predict
+        prediction = self.predictor(context_embeddings)
+        
+        # --- LOSS 1: Cosine Distance (Direction) ---
+        cos_sim = F.cosine_similarity(prediction, target_embeddings, dim=-1).mean()
+        loss_pred = 1.0 - cos_sim
+        
+        # --- LOSS 2: Variance (FIXED: Encoder Only) ---
+        # We ONLY force the Context Encoder to explode.
+        # We REMOVE the constraint on the Predictor to stop it from adding noise.
+        std_context = torch.sqrt(context_embeddings.var(dim=0) + 0.0001)
+        std_loss = torch.mean(F.relu(1.0 - std_context))
+
+        # --- LOSS 3: Covariance (Decorrelation on Encoder) ---
+        def off_diagonal(x):
+            n, m = x.shape
+            return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+        
+        ctx_norm = context_embeddings - context_embeddings.mean(dim=0)
+        cov_ctx = (ctx_norm.T @ ctx_norm) / (context_embeddings.size(0) - 1)
+        cov_loss_ctx = off_diagonal(cov_ctx).pow_(2).sum() / context_embeddings.size(1)
+
+        # Total Loss
+        # Weights: 
+        # Pred: 1.0
+        # Var: 25.0 (Push the encoder hard)
+        # Cov: 1.0
+        loss = loss_pred + (25.0 * std_loss) + (1.0 * cov_loss_ctx)
+        
+        # Return metrics for logging
+        return loss, prediction, target_embeddings, loss_pred, cov_loss_ctx, std_loss
+    
+    @torch.no_grad()
+    def update_target_ema(self):
+        for param, ema_param in zip(self.context_encoder.parameters(), self.target_encoder.parameters()):
+            ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
+
+# --- EXECUTION ---
+def main():
+    print(f"Using device: {Config.device}")
+    
+    wandb.login()
+    # FIX: Clean config dict for WandB
+    config_dict = {k: v for k, v in Config.__dict__.items() if not k.startswith('__')}
+    wandb.init(project="para-jepa-hybrid-v3", config=config_dict)
+    
+    print("Mounting Google Drive...")
+    drive.mount('/content/drive')
+    drive_save_path = "/content/drive/MyDrive/ParaJEPA_Checkpoints"
+    os.makedirs(drive_save_path, exist_ok=True)
+
+    # Initialize components
+    tokenizer = AutoTokenizer.from_pretrained(Config.model_name)
+    model = ParaJEPA(Config.model_name, Config.hidden_dim, pred_depth=Config.pred_depth, pred_hidden_dim=Config.pred_hidden_dim).to(Config.device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.learning_rate, weight_decay=Config.weight_decay)
+    
+    # Load Data
+    train_set = WikiAutoAssetDataset(tokenizer, split='train', max_samples=5000) 
+    valid_set = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=500)
+    
+    train_loader = DataLoader(train_set, batch_size=Config.batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_set, batch_size=Config.batch_size, shuffle=False)
+    
+    # Train Loop
+    best_loss = float('inf')
+    
+    for epoch in range(Config.epochs):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        
+        for batch in pbar:
+            s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+            c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+            
+            loss, _, _, loss_pred, cov_loss, std_loss = model(s_in, c_in)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            model.update_target_ema()
+            
+            wandb.log({
+                "train_loss": loss.item(), 
+                "pred_loss": loss_pred.item(),
+                "cov_loss": cov_loss.item(), 
+                "std_loss": std_loss.item(),
+                "epoch": epoch
+            })
+            pbar.set_postfix({'loss': loss.item(), 'std': std_loss.item()})
+            
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in valid_loader:
+                s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+                c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+                loss, _, _, _, _, _ = model(s_in, c_in)
+                val_loss += loss.item()
+        
+        avg_val = val_loss / len(valid_loader)
+        print(f"Epoch {epoch+1} Val Loss: {avg_val:.4f}")
+        wandb.log({"val_loss": avg_val})
+        
+        if avg_val < best_loss:
+            best_loss = avg_val
+            torch.save(model.state_dict(), f"{drive_save_path}/para_jepa_hybrid_best.pt")
+            print(f"Checkpoint Saved")
+
+    print("Training Complete.")
+    wandb.finish()
+
+if __name__ == "__main__":
+    main()
+
+Results:
+
+
+
+
+Mounting Google Drive...
+Drive already mounted at /content/drive; to attempt to forcibly remount, call drive.mount("/content/drive", force_remount=True).
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+Loading train dataset...
+Loading validation dataset...
+Epoch 1: 100%|██████████| 313/313 [02:36<00:00, 2.01it/s, loss=19.2, std=0.575]
+
+Epoch 1 Val Loss: 25.0277
+Checkpoint Saved
+Epoch 2: 100%|██████████| 313/313 [02:34<00:00, 2.02it/s, loss=19.5, std=0.558]
+
+Epoch 2 Val Loss: 25.2166
+
+Epoch 3: 100%|██████████| 313/313 [02:33<00:00, 2.04it/s, loss=19.8, std=0.54]
+
+Epoch 3 Val Loss: 25.5969
+
+Epoch 4: 100%|██████████| 313/313 [02:33<00:00, 2.04it/s, loss=19.3, std=0.565]
+
+Epoch 4 Val Loss: 25.6550
+
+Epoch 5: 100%|██████████| 313/313 [02:33<00:00, 2.04it/s, loss=19.7, std=0.547]
+
+Epoch 5 Val Loss: 25.9534
+Training Complete.
+
+
+
+🔄 Setting up Diagnostic Environment...
+
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+📂 Loading checkpoint from: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_hybrid_best.pt
+✅ Model loaded successfully.
+📚 Loading validation sample...
+Loading validation dataset...
+
+========================================
+🔎 RUNNING HYBRID FORENSICS
+========================================
+📊 BATCH STATISTICS:
+--- Angles (Cosine) ---
+1. Natural Similarity : 0.69107
+2. Model Performance : 0.47185 (Higher is better)
+3. Identity Check : 0.30498
+
+--- Expansion Check (Target: ~1.0) ---
+4. Context Std Dev : 0.32754 <-- DID THE DEAD GRADIENT FIX WORK?
+5. Predictor Std Dev : 0.09679
+
+🧐 DIAGNOSIS:
+⚠️ STRUGGLING: Model has expanded, but hasn't beaten the baseline yet.
+
+
+Outcome:
+
+This confirms a subtle but fatal phenomenon known as "EMA Lag" (or Semantic Drift).
+The Diagnosis: Why v3 Failed
+1. The Good News: The Context Encoder did expand (Standard Deviation rose from 0.02 to 0.33). The "Dead Gradient" fix worked.
+2. The Bad News: The "Predictor" collapsed to 0.09.
+3. The Cause:
+    * You updated the Context Encoder (Student) to expand its geometry.
+    * The Target Encoder (Teacher) is an EMA copy. It updates slowly.
+    * The Mismatch: The Student became "Spherical/Expanded" (0.33), but the Teacher remained "Conical/Narrow" (lagging behind).
+    * The Crash: The Predictor tried to map a Large Sphere (Context) to a Tiny Cone (Target). This is mathematically impossible to do well. The Predictor gave up and outputted small, generic vectors (0.09) to minimize the error, resulting in the terrible 0.47 performance.
+Trial 8: Freeze the Backbone (RoBERTa)
+# 1. Install Dependencies
+!pip install -q transformers datasets wandb textstat scikit-learn
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel, AutoTokenizer
+from datasets import load_dataset
+from google.colab import drive
+import copy
+from tqdm import tqdm
+import json
+import wandb
+import random
+import numpy as np
+import os
+
+# --- CONFIGURATION ---
+class Config:
+    model_name = 'roberta-base'
+    hidden_dim = 768
+    pred_depth = 3
+    pred_hidden_dim = 196
+    
+    # Training
+    batch_size = 16 
+    learning_rate = 1e-3 # Higher LR because we are only training Heads
+    epochs = 5
+    weight_decay = 1e-4 # Slight decay for stability
+    max_length = 128
+    seed = 42
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# --- DATASET ---
+class WikiAutoAssetDataset(Dataset):
+    def __init__(self, tokenizer, split="train", max_length=128, max_samples=None):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.split = split
+        
+        print(f"Loading {split} dataset...")
+        try:
+            self.dataset = load_dataset("GEM/wiki_auto_asset_turk", split=split)
+        except Exception as e:
+            print(f"Error loading dataset: {e}")
+            self.dataset = []
+
+        if max_samples:
+            self.dataset = self.dataset.select(range(min(len(self.dataset), max_samples)))
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        item = self.dataset[idx]
+        complex_text = item['source']
+        
+        if self.split == 'train':
+            if 'target' in item: simple_text = item['target']
+            elif 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            else: simple_text = complex_text 
+        else:
+            if 'references' in item and len(item['references']) > 0: simple_text = item['references'][0]
+            elif 'target' in item: simple_text = item['target']
+            else: simple_text = complex_text
+        
+        style_enc = self.tokenizer(complex_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+        content_enc = self.tokenizer(simple_text, max_length=self.max_length, padding='max_length', truncation=True, return_tensors='pt')
+
+        return {
+            'style_input_ids': style_enc['input_ids'].squeeze(0),
+            'style_attention_mask': style_enc['attention_mask'].squeeze(0),
+            'content_input_ids': content_enc['input_ids'].squeeze(0),
+            'content_attention_mask': content_enc['attention_mask'].squeeze(0),
+        }
+
+# --- MODELS (Hybrid v5: Frozen Backbone) ---
+class JEPAEncoder(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768):
+        super().__init__()
+        self.backbone = AutoModel.from_pretrained(model_name)
+        
+        # FREEZE BACKBONE IMMEDIATELY
+        for param in self.backbone.parameters():
+            param.requires_grad = False
+            
+        # VICReg Projection (Trainable)
+        # This layer handles Cone -> Sphere transformation
+        self.projection = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim) 
+        )
+    
+    def forward(self, input_ids, attention_mask):
+        with torch.no_grad(): # Ensure no gradients flow to backbone
+            outputs = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
+            token_embeddings = outputs.last_hidden_state
+
+            # Mean Pooling
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            mean_pooled = sum_embeddings / sum_mask
+
+        # Project (Trainable Part)
+        embeddings = self.projection(mean_pooled)
+        return embeddings
+
+class JEPAPredictor(nn.Module):
+    def __init__(self, input_dim=768, hidden_dim=256, output_dim=768, depth=3):
+        super().__init__()
+        layers = [nn.Linear(input_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()]
+        for _ in range(depth-2):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.GELU()])
+        layers.append(nn.Linear(hidden_dim, output_dim))
+        self.layers = nn.Sequential(*layers)
+    
+    def forward(self, x): return self.layers(x)
+
+class ParaJEPA(nn.Module):
+    def __init__(self, model_name='roberta-base', hidden_dim=768, ema_decay=0.996, pred_depth=3, pred_hidden_dim=196):
+        super().__init__()
+        self.ema_decay = ema_decay
+        self.context_encoder = JEPAEncoder(model_name, hidden_dim)
+        self.target_encoder = copy.deepcopy(self.context_encoder)
+        
+        # Target Encoder is frozen (EMA updated)
+        for p in self.target_encoder.parameters(): p.requires_grad = False
+            
+        self.predictor = JEPAPredictor(input_dim=hidden_dim, hidden_dim=pred_hidden_dim, output_dim=hidden_dim, depth=pred_depth)
+    
+    def forward(self, style_input, content_input):
+        # 1. Encode
+        context_embeddings = self.context_encoder(style_input['input_ids'], style_input['attention_mask'])
+        with torch.no_grad():
+            target_embeddings = self.target_encoder(content_input['input_ids'], content_input['attention_mask'])
+        
+        # 2. Predict
+        prediction = self.predictor(context_embeddings)
+        
+        # --- LOSS 1: Cosine Distance (Direction) ---
+        cos_sim = F.cosine_similarity(prediction, target_embeddings, dim=-1).mean()
+        loss_pred = 1.0 - cos_sim
+        
+        # --- LOSS 2: Variance (Context Only) ---
+        # Force the Projector to expand the Frozen Backbone's output
+        std_context = torch.sqrt(context_embeddings.var(dim=0) + 0.0001)
+        
+        # Target 0.5 (Semi-Expanded)
+        std_loss = torch.mean(F.relu(0.5 - std_context))
+
+        # --- LOSS 3: Covariance (Decorrelation on Encoder) ---
+        def off_diagonal(x):
+            n, m = x.shape
+            return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
+        
+        ctx_norm = context_embeddings - context_embeddings.mean(dim=0)
+        cov_ctx = (ctx_norm.T @ ctx_norm) / (context_embeddings.size(0) - 1)
+        cov_loss_ctx = off_diagonal(cov_ctx).pow_(2).sum() / context_embeddings.size(1)
+
+        # Total Loss
+        loss = loss_pred + (10.0 * std_loss) + (1.0 * cov_loss_ctx)
+        
+        return loss, prediction, target_embeddings, loss_pred, cov_loss_ctx, std_loss
+    
+    @torch.no_grad()
+    def update_target_ema(self):
+        # We only need to update the Projector parameters in EMA, 
+        # since Backbone is frozen and identical in both.
+        for param, ema_param in zip(self.context_encoder.projection.parameters(), self.target_encoder.projection.parameters()):
+            ema_param.data = self.ema_decay * ema_param.data + (1 - self.ema_decay) * param.data
+
+# --- EXECUTION ---
+def main():
+    print(f"Using device: {Config.device}")
+    
+    wandb.login()
+    config_dict = {k: v for k, v in Config.__dict__.items() if not k.startswith('__')}
+    wandb.init(project="para-jepa-hybrid-v5-frozen", config=config_dict)
+    
+    print("Mounting Google Drive...")
+    drive.mount('/content/drive')
+    drive_save_path = "/content/drive/MyDrive/ParaJEPA_Checkpoints"
+    os.makedirs(drive_save_path, exist_ok=True)
+
+    # Initialize components
+    tokenizer = AutoTokenizer.from_pretrained(Config.model_name)
+    model = ParaJEPA(Config.model_name, Config.hidden_dim, pred_depth=Config.pred_depth, pred_hidden_dim=Config.pred_hidden_dim).to(Config.device)
+    
+    # Optimizer (Backbone is already frozen via requires_grad=False, so just pass model.parameters())
+    # We use a higher LR (1e-3) because we are training from scratch on the Heads.
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
+                                  lr=Config.learning_rate, 
+                                  weight_decay=Config.weight_decay)
+    
+    print(f"Optimizer Configured. Training ONLY Heads.")
+    
+    # Load Data
+    train_set = WikiAutoAssetDataset(tokenizer, split='train', max_samples=5000) 
+    valid_set = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=500)
+    
+    train_loader = DataLoader(train_set, batch_size=Config.batch_size, shuffle=True)
+    valid_loader = DataLoader(valid_set, batch_size=Config.batch_size, shuffle=False)
+    
+    # Train Loop
+    best_loss = float('inf')
+    
+    for epoch in range(Config.epochs):
+        model.train()
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+        
+        for batch in pbar:
+            s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+            c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+            
+            loss, _, _, loss_pred, cov_loss, std_loss = model(s_in, c_in)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            model.update_target_ema()
+            
+            wandb.log({
+                "train_loss": loss.item(), 
+                "pred_loss": loss_pred.item(),
+                "cov_loss": cov_loss.item(), 
+                "std_loss": std_loss.item(),
+                "epoch": epoch
+            })
+            pbar.set_postfix({'loss': loss.item(), 'std': std_loss.item()})
+            
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch in valid_loader:
+                s_in = {'input_ids': batch['style_input_ids'].to(Config.device), 'attention_mask': batch['style_attention_mask'].to(Config.device)}
+                c_in = {'input_ids': batch['content_input_ids'].to(Config.device), 'attention_mask': batch['content_attention_mask'].to(Config.device)}
+                loss, _, _, _, _, _ = model(s_in, c_in)
+                val_loss += loss.item()
+        
+        avg_val = val_loss / len(valid_loader)
+        print(f"Epoch {epoch+1} Val Loss: {avg_val:.4f}")
+        wandb.log({"val_loss": avg_val})
+        
+        if avg_val < best_loss:
+            best_loss = avg_val
+            torch.save(model.state_dict(), f"{drive_save_path}/para_jepa_hybrid_best.pt")
+            print(f"Checkpoint Saved")
+
+    print("Training Complete.")
+    wandb.finish()
+
+if __name__ == "__main__":
+    main()
+
+Results:
+
+Loading validation dataset...
+
+Epoch 1: 100%|██████████| 313/313 [01:08<00:00,  4.59it/s, loss=3.15, std=0.206]
+
+Epoch 1 Val Loss: 4.8219
+Checkpoint Saved
+Epoch 2: 100%|██████████| 313/313 [01:13<00:00,  4.29it/s, loss=3.63, std=0.163]
+
+Epoch 2 Val Loss: 5.0363
+
+Epoch 3: 100%|██████████| 313/313 [01:16<00:00,  4.11it/s, loss=3.5, std=0.197]
+
+Epoch 3 Val Loss: 5.2757
+
+Epoch 4: 100%|██████████| 313/313 [01:16<00:00,  4.08it/s, loss=3.61, std=0.17]
+
+Epoch 4 Val Loss: 5.4394
+
+Epoch 5: 100%|██████████| 313/313 [01:16<00:00,  4.08it/s, loss=3.81, std=0.166]
+
+Epoch 5 Val Loss: 5.3984
+Training Complete.
+
+
+I also realized pred_loss was increasing each step
+
+🔄 Setting up Diagnostic Environment...
+
+Some weights of RobertaModel were not initialized from the model checkpoint at roberta-base and are newly initialized: ['pooler.dense.bias', 'pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+📂 Loading checkpoint from: /content/drive/MyDrive/ParaJEPA_Checkpoints/para_jepa_hybrid_best.pt
+✅ Model loaded successfully.
+📚 Loading validation sample...
+Loading validation dataset...
+
+========================================
+🔎 RUNNING HYBRID FORENSICS
+========================================
+📊 BATCH STATISTICS:
+  --- Angles (Cosine) ---
+  1. Natural Similarity : 0.83535
+  2. Model Performance  : 0.91462 (Higher is better)
+  3. Identity Check     : 0.75984
+
+  --- Expansion Check (Target: ~1.0) ---
+  4. Context Std Dev    : 0.23748  <-- DID THE DEAD GRADIENT FIX WORK?
+  5. Predictor Std Dev  : 0.06795
+
+🧐 DIAGNOSIS:
+🚀 LEARNING CONFIRMED: The model beat the natural baseline!
+   Gain: +0.07927
+
+Also, ran this evaluation code:import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.linear_model import Ridge
+from sklearn.metrics import r2_score
+from sklearn.manifold import TSNE
+from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
+
+# --- 1. SETUP & DATA ---
+print("📊 PREPARING COMPREHENSIVE EVALUATION...")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+tokenizer = AutoTokenizer.from_pretrained('roberta-base')
+
+# Ensure model is in eval mode
+model.eval()
+model.to(device)
+
+# Use a larger sample for eval
+eval_dataset = WikiAutoAssetDataset(tokenizer, split='validation', max_samples=1000) 
+eval_loader = DataLoader(eval_dataset, batch_size=32, shuffle=False)
+
+def get_embeddings(model, loader, device):
+    """Extracts Source, Target, and Predicted embeddings + Metadata"""
+    model.eval()
+    source_embs = []
+    target_embs = []
+    pred_embs = []
+    lengths_source = []
+    lengths_target = []
+    
+    print("🚀 Extracting Embeddings...")
+    with torch.no_grad():
+        for batch in tqdm(loader):
+            # Move to device
+            s_input = batch['style_input_ids'].to(device)
+            s_mask = batch['style_attention_mask'].to(device)
+            c_input = batch['content_input_ids'].to(device)
+            c_mask = batch['content_attention_mask'].to(device)
+            
+            # 1. Get Encodings
+            # Source (Context Encoder)
+            s_emb = model.context_encoder(s_input, s_mask)
+            # Target (Target Encoder)
+            t_emb = model.target_encoder(c_input, c_mask)
+            
+            # 2. Get Prediction
+            p_emb = model.predictor(s_emb)
+            
+            # Store
+            source_embs.append(s_emb.cpu().numpy())
+            target_embs.append(t_emb.cpu().numpy())
+            pred_embs.append(p_emb.cpu().numpy())
+            
+            # Store Lengths
+            lengths_source.append(s_mask.sum(dim=1).cpu().numpy())
+            lengths_target.append(c_mask.sum(dim=1).cpu().numpy())
+            
+    return (np.vstack(source_embs), np.vstack(target_embs), np.vstack(pred_embs), 
+            np.concatenate(lengths_source), np.concatenate(lengths_target))
+
+# Run Extraction
+S, T, P, len_s, len_t = get_embeddings(model, eval_loader, device)
+
+print(f"\n✅ Extracted {len(S)} samples.")
+print(f"   Source Shape: {S.shape}")
+print(f"   Target Shape: {T.shape}")
+print(f"   Pred Shape:   {P.shape}")
+
+# --- 2. PILLAR 1: ALIGNMENT SHIFT ---
+print("\n" + "="*50)
+print("📐 PILLAR 1: GEOMETRIC ALIGNMENT")
+print("="*50)
+
+def cosine_sim_numpy(a, b):
+    norm_a = np.linalg.norm(a, axis=1)
+    norm_b = np.linalg.norm(b, axis=1)
+    return np.sum(a * b, axis=1) / (norm_a * norm_b + 1e-9)
+
+baseline_sim = cosine_sim_numpy(S, T).mean()
+model_sim = cosine_sim_numpy(P, T).mean()
+identity_sim = cosine_sim_numpy(P, S).mean()
+
+print(f"1. Baseline Similarity (Source vs Target): {baseline_sim:.4f}")
+print(f"2. Model Similarity    (Pred vs Target):   {model_sim:.4f}")
+print(f"3. Identity Check      (Pred vs Source):   {identity_sim:.4f}")
+
+gain = model_sim - baseline_sim
+if gain > 0:
+    print(f"✅ SUCCESS: Positive Semantic Shift (+{gain:.4f})")
+else:
+    print(f"⚠️ FAILURE: Negative Shift ({gain:.4f}).")
+
+
+# --- 3. PILLAR 2: RETRIEVAL ---
+print("\n" + "="*50)
+print("🔎 PILLAR 2: RETRIEVAL EVALUATION")
+print("="*50)
+
+# Calculate Cosine Similarity Matrix
+sim_matrix = cosine_similarity(P, T) # Shape (N, N)
+
+correct_indices = np.arange(len(sim_matrix))
+predicted_indices_top1 = np.argmax(sim_matrix, axis=1)
+predicted_indices_top5 = np.argsort(sim_matrix, axis=1)[:, -5:]
+
+recall_1 = np.mean(predicted_indices_top1 == correct_indices)
+recall_5 = np.mean([correct_indices[i] in predicted_indices_top5[i] for i in range(len(correct_indices))])
+
+print(f"Recall@1: {recall_1:.2%} (Chance: {1/len(S):.2%})")
+print(f"Recall@5: {recall_5:.2%} (Chance: {5/len(S):.2%})")
+
+if recall_1 > 0.6: print("✅ SUCCESS: Strong Semantic matching.")
+elif recall_1 > 0.2: print("⚖️ OKAY: Learning confirmed.")
+else: print("❌ FAILURE: Retrieval failed.")
+
+
+# --- 4. PILLAR 3: DISENTANGLEMENT PROBE ---
+print("\n" + "="*50)
+print("🎨 PILLAR 3: STYLE/LENGTH PROBING")
+print("="*50)
+
+def run_probe(embeddings, lengths, name):
+    split = int(len(embeddings) * 0.8)
+    X_train, X_test = embeddings[:split], embeddings[split:]
+    y_train, y_test = lengths[:split], lengths[split:]
+    
+    reg = Ridge(alpha=1.0)
+    reg.fit(X_train, y_train)
+    score = reg.score(X_test, y_test)
+    print(f"  {name} R² Score: {score:.4f}")
+    return score
+
+r2_source = run_probe(S, len_s, "Source (Complex) Embeddings")
+r2_pred = run_probe(P, len_s, "Prediction (Simplified) Embeddings") 
+
+diff = r2_source - r2_pred
+print(f"\nDiff: {diff:.4f}")
+if diff > 0.05:
+    print("✅ SUCCESS: Disentanglement detected.")
+else:
+    print("⚖️ NEUTRAL: Length info preserved.")
+
+# --- 5. VISUALIZATION ---
+print("\n" + "="*50)
+print("👁️ VISUALIZATION")
+print("="*50)
+
+try:
+    N_vis = 200
+    tsne = TSNE(n_components=2, random_state=42, perplexity=30, init='pca', learning_rate='auto')
+    combined = np.vstack([S[:N_vis], T[:N_vis], P[:N_vis]])
+    reduced = tsne.fit_transform(combined)
+
+    s_red = reduced[:N_vis]
+    t_red = reduced[N_vis:2*N_vis]
+    p_red = reduced[2*N_vis:]
+
+    plt.figure(figsize=(12, 8))
+    plt.scatter(s_red[:,0], s_red[:,1], alpha=0.4, label='Source (Complex)', c='red', s=30)
+    plt.scatter(t_red[:,0], t_red[:,1], alpha=0.4, label='Target (Simple)', c='green', s=30)
+    plt.scatter(p_red[:,0], p_red[:,1], alpha=0.8, label='Prediction', c='blue', marker='x', s=40)
+
+    # Arrows for first 15 points
+    for i in range(15):
+        plt.arrow(s_red[i,0], s_red[i,1], 
+                  p_red[i,0]-s_red[i,0], p_red[i,1]-s_red[i,1], 
+                  color='gray', alpha=0.3, width=0.002, head_width=0.5)
+
+    plt.legend()
+    plt.title(f"Embedding Space Shift (Sample N={N_vis})\nGray Arrows = Transformation Vector")
+    plt.show()
+except Exception as e:
+    print(f"Skipping visualization due to error: {e}")
+📊 PREPARING COMPREHENSIVE EVALUATION...
+Loading validation dataset...
+🚀 Extracting Embeddings...
+
+100%|██████████| 32/32 [00:12<00:00,  2.63it/s]
+
+
+✅ Extracted 1000 samples.
+   Source Shape: (1000, 768)
+   Target Shape: (1000, 768)
+   Pred Shape:   (1000, 768)
+
+==================================================
+📐 PILLAR 1: GEOMETRIC ALIGNMENT
+==================================================
+1. Baseline Similarity (Source vs Target): 0.8369
+2. Model Similarity    (Pred vs Target):   0.9238
+3. Identity Check      (Pred vs Source):   0.7713
+✅ SUCCESS: Positive Semantic Shift (+0.0870)
+
+==================================================
+🔎 PILLAR 2: RETRIEVAL EVALUATION
+==================================================
+Task: Given a Complex Sentence, find its Simple pair among 999 distractors.
+Recall@1: 0.30% (Chance: 0.10%)
+Recall@5: 1.70% (Chance: 0.50%)
+❌ FAILURE: Model cannot match pairs.
+
+==================================================
+🎨 PILLAR 3: STYLE/LENGTH PROBING
+==================================================
+Training Length Probes...
+  Source (Complex) Embeddings R² Score: 0.7085
+  Prediction (Simplified) Embeddings R² Score: 0.8009
+
+Diff: -0.0924
+⚠️ STRANGE: The model made length info *more* prominent.
+
+Outcome:This is a fascinating and highly educational result. You have successfully engineered a "Generic Simplification Vector," but you have lost the "Semantic Identity."
+Here is the breakdown of what happened, why it happened, and the exact next step to fix it.
+1. The Diagnosis: "The Average Simple Sentence"
+Your results tell a very specific story:
+* Geometric Success (Pillar 1): You increased similarity from 0.83 to 0.92. This means your model successfully learned to push vectors into the "Simple" region of the latent space.
+* Retrieval Failure (Pillar 2): Recall is 0.3%. This means that while the model moves the vector to the "Simple" region, it forgets which sentence it was. It maps "The cat sat" and "The dog ran" to the same generic "Simple Sentence" location.
+* The "Strange" Probe (Pillar 3): Your model predicts length better than the source (0.80 vs 0.70).
+    * Meaning: Your model figured out that "Simple = Short." It learned to aggressively encode "Shortness" into the embedding. It effectively turned into a Length Encoder.
+Visual Confirmation (Your TSNE Plot): Look at the Blue Xs (Predictions). They are not overlapping the Green dots (Targets). Instead, they form their own distinct cluster in the upper-left.
+* The model learned a systematic shift (represented by the grey lines).
+* It applies this same shift to every sentence, creating a "Ghost Cloud" of predictions that looks like the simple data but doesn't align instance-by-instance.
+2. Why did this happen? (The "Regression Trap")
+We used Cosine Regression (Maximize similarity to Target).
+* The Flaw: The loss function only says: "Be close to Target A." It never says: "Be FAR from Target B."
+* The Result: Since all simple sentences in WikiAuto look somewhat similar (short, simple words), the easiest way to minimize loss is to output a "Average Simple Vector" that is roughly close to everything. This satisfies the Cosine Loss (Pillar 1) but destroys Identity (Pillar 2).
